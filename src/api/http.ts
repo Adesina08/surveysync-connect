@@ -48,13 +48,18 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
   }
 
   if (!response.ok) {
-    const message =
+    const messageFromPayload =
       typeof payload === 'string'
         ? payload
         : (payload as { message?: string; error?: string } | null)?.message ||
-          (payload as { message?: string; error?: string } | null)?.error ||
-          response.statusText;
-    throw new Error(message || 'Request failed');
+          (payload as { message?: string; error?: string } | null)?.error;
+    const statusMessage = response.statusText || `HTTP ${response.status}`;
+    const message = messageFromPayload || statusMessage;
+    const isMissingApiBase = !API_BASE_URL && response.status === 404;
+    const suggestedFix = isMissingApiBase
+      ? 'API endpoint not found. Ensure the backend is running and VITE_API_BASE_URL is configured.'
+      : null;
+    throw new Error(suggestedFix || message || 'Request failed');
   }
 
   return payload as T;
