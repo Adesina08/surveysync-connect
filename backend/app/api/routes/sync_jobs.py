@@ -5,7 +5,7 @@ from datetime import datetime
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
-from backend.app.services import sync_engine
+from app.services import sync_engine
 
 router = APIRouter(prefix="/sync-jobs", tags=["sync-jobs"])
 

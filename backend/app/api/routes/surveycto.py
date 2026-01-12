@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
-from backend.app.services import surveycto_service
+from app.services import surveycto_service
 
 router = APIRouter(prefix="/surveycto", tags=["surveycto"])
 
