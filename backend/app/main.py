@@ -4,7 +4,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import postgres, sessions, surveycto, sync_jobs
 from app.db.session import init_db
 
-
 app = FastAPI(title="SurveySync Connect Backend")
 
 app.add_middleware(
@@ -12,7 +11,10 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:8080",
         "http://127.0.0.1:8080",
-        "https://YOUR-NETLIFY-SITE.netlify.app",
+
+        # 🔴 REPLACE THIS WITH YOUR ACTUAL NETLIFY URL
+        # example: "https://surveysync-connect.netlify.app"
+        "https://surveytosql.netlify.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
