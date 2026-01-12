@@ -1,8 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.app.api.routes import postgres, sessions, surveycto, sync_jobs
-from backend.app.db.session import init_db
+from app.api.routes import postgres, sessions, surveycto, sync_jobs
+from app.db.session import init_db
+
 
 app = FastAPI(title="SurveySync Connect Backend")
 
