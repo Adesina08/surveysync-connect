@@ -6,10 +6,10 @@ import type {
   SchemaCompatibility 
 } from './types';
 import type { SurveyCTOField } from './types';
-import { mockSchemas, delay, shouldFail } from './mockData';
+import { apiRequest } from './http';
 
 // Connection state
-let currentConnection: { credentials: PostgresCredentials } | null = null;
+let isDbConnected = false;
 
 /**
  * Tests PostgreSQL connection and returns available schemas/tables
@@ -21,9 +21,6 @@ let currentConnection: { credentials: PostgresCredentials } | null = null;
 export async function connectPostgres(
   credentials: PostgresCredentials
 ): Promise<PostgresConnectionResponse> {
-  // Simulate network latency (1000ms - 2500ms for DB connection)
-  await delay(1000 + Math.random() * 1500);
-
   // Validate input
   if (!credentials.host?.trim()) {
     return {
@@ -53,43 +50,21 @@ export async function connectPostgres(
     };
   }
 
-  // Simulate connection failures for specific test cases
-  if (credentials.host === 'invalid.host') {
+  try {
+    const response = await apiRequest<PostgresConnectionResponse>('/api/pg/connect', {
+      method: 'POST',
+      body: JSON.stringify(credentials),
+    });
+
+    isDbConnected = Boolean(response.success);
+    return response;
+  } catch (error) {
+    isDbConnected = false;
     return {
       success: false,
-      error: 'Could not resolve hostname. Please check the host address.',
+      error: error instanceof Error ? error.message : 'Connection failed',
     };
   }
-
-  if (credentials.database === 'nonexistent') {
-    return {
-      success: false,
-      error: `Database "${credentials.database}" does not exist`,
-    };
-  }
-
-  if (credentials.password === 'wrongpassword') {
-    return {
-      success: false,
-      error: 'Password authentication failed',
-    };
-  }
-
-  // Simulate connection timeout
-  if (shouldFail(0.05)) {
-    return {
-      success: false,
-      error: 'Connection timed out. Please check if the database server is accessible.',
-    };
-  }
-
-  // Store connection
-  currentConnection = { credentials };
-
-  return {
-    success: true,
-    schemas: mockSchemas,
-  };
 }
 
 /**
@@ -99,13 +74,11 @@ export async function connectPostgres(
  * GET /api/pg/schemas
  */
 export async function fetchSchemas(): Promise<PostgresSchema[]> {
-  await delay(300 + Math.random() * 300);
-
-  if (!currentConnection) {
+  if (!isDbConnected) {
     throw new Error('Not connected to database');
   }
 
-  return mockSchemas;
+  return apiRequest<PostgresSchema[]>('/api/pg/schemas');
 }
 
 /**
@@ -115,14 +88,13 @@ export async function fetchSchemas(): Promise<PostgresSchema[]> {
  * GET /api/pg/schemas/:schemaName/tables
  */
 export async function fetchTables(schemaName: string): Promise<PostgresTable[]> {
-  await delay(200 + Math.random() * 200);
-
-  if (!currentConnection) {
+  if (!isDbConnected) {
     throw new Error('Not connected to database');
   }
 
-  const schema = mockSchemas.find(s => s.name === schemaName);
-  return schema?.tables || [];
+  return apiRequest<PostgresTable[]>(
+    `/api/pg/schemas/${encodeURIComponent(schemaName)}/tables`
+  );
 }
 
 /**
@@ -137,57 +109,18 @@ export async function validateSchemaCompatibility(
   targetSchema: string,
   targetTable: string
 ): Promise<SchemaCompatibility> {
-  await delay(400 + Math.random() * 400);
-
-  if (!currentConnection) {
+  if (!isDbConnected) {
     throw new Error('Not connected to database');
   }
 
-  const schema = mockSchemas.find(s => s.name === targetSchema);
-  const table = schema?.tables.find(t => t.name === targetTable);
-
-  if (!table) {
-    // New table - always compatible
-    return {
-      compatible: true,
-      missingColumns: [],
-      extraColumns: [],
-      typeMismatches: [],
-      primaryKeyMatch: true,
-    };
-  }
-
-  // Check for missing columns (in form but not in table)
-  const tableColumnNames = table.columns.map(c => c.name.toLowerCase());
-  const formFieldNames = formFields.map(f => f.name.toLowerCase());
-  
-  const missingColumns = formFields
-    .filter(f => !tableColumnNames.includes(f.name.toLowerCase()))
-    .map(f => f.name);
-
-  // Check for extra columns (in table but not in form) - excluding common metadata
-  const metadataColumns = ['created_at', 'updated_at', 'id'];
-  const extraColumns = table.columns
-    .filter(c => 
-      !formFieldNames.includes(c.name.toLowerCase()) && 
-      !metadataColumns.includes(c.name.toLowerCase())
-    )
-    .map(c => c.name);
-
-  // Check primary key match
-  const formPK = formFields.find(f => f.isPrimaryKey);
-  const primaryKeyMatch = formPK ? 
-    table.primaryKey?.toLowerCase() === formPK.name.toLowerCase() || 
-    table.primaryKey?.toLowerCase() === 'id' : 
-    false;
-
-  return {
-    compatible: missingColumns.length === 0 && primaryKeyMatch,
-    missingColumns,
-    extraColumns,
-    typeMismatches: [], // Simplified for mock
-    primaryKeyMatch,
-  };
+  return apiRequest<SchemaCompatibility>('/api/pg/validate-schema', {
+    method: 'POST',
+    body: JSON.stringify({
+      formFields,
+      targetSchema,
+      targetTable,
+    }),
+  });
 }
 
 /**
@@ -202,35 +135,45 @@ export async function createTable(
   tableName: string,
   formFields: SurveyCTOField[]
 ): Promise<{ success: boolean; error?: string }> {
-  await delay(800 + Math.random() * 500);
-
-  if (!currentConnection) {
+  if (!isDbConnected) {
     return { success: false, error: 'Not connected to database' };
   }
 
-  // Check if table already exists
-  const schema = mockSchemas.find(s => s.name === schemaName);
-  if (schema?.tables.find(t => t.name === tableName)) {
-    return { success: false, error: `Table "${schemaName}.${tableName}" already exists` };
+  try {
+    const response = await apiRequest<{ success: boolean; error?: string }>('/api/pg/tables', {
+      method: 'POST',
+      body: JSON.stringify({
+        schemaName,
+        tableName,
+        columns: formFields.map(field => ({
+          name: field.name,
+          type: mapFieldTypeToPostgres(field.type),
+          nullable: !field.isPrimaryKey,
+          isPrimaryKey: field.isPrimaryKey,
+        })),
+      }),
+    });
+    return response;
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to create table',
+    };
   }
-
-  // In real implementation, would execute CREATE TABLE statement
-  // For mock, we just return success
-  return { success: true };
 }
 
 /**
  * Disconnects from the database
  */
 export function disconnect(): void {
-  currentConnection = null;
+  isDbConnected = false;
 }
 
 /**
  * Checks if there's an active database connection
  */
 export function isConnected(): boolean {
-  return currentConnection !== null;
+  return isDbConnected;
 }
 
 /**

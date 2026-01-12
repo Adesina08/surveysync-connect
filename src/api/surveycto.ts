@@ -1,8 +1,6 @@
 import type { SurveyCTOCredentials, SurveyCTOAuthResponse, SurveyCTOForm } from './types';
-import { mockForms, delay, shouldFail } from './mockData';
-
-// Session storage for mock auth state
-let currentSession: { token: string; serverName: string } | null = null;
+import { apiRequest } from './http';
+import { getSessionToken as getStoredSessionToken, setSessionToken } from './session';
 
 /**
  * Authenticates with SurveyCTO server and returns available forms
@@ -14,9 +12,6 @@ let currentSession: { token: string; serverName: string } | null = null;
 export async function authenticateSurveyCTO(
   credentials: SurveyCTOCredentials
 ): Promise<SurveyCTOAuthResponse> {
-  // Simulate network latency (800ms - 2000ms)
-  await delay(800 + Math.random() * 1200);
-
   // Validate input
   if (!credentials.serverName?.trim()) {
     return {
@@ -39,43 +34,24 @@ export async function authenticateSurveyCTO(
     };
   }
 
-  // Simulate authentication failure for specific test cases
-  if (credentials.serverName.toLowerCase() === 'invalid') {
+  try {
+    const response = await apiRequest<SurveyCTOAuthResponse>('/api/sessions/surveycto', {
+      method: 'POST',
+      auth: false,
+      body: JSON.stringify(credentials),
+    });
+
+    if (response.success && response.sessionToken) {
+      setSessionToken(response.sessionToken);
+    }
+
+    return response;
+  } catch (error) {
     return {
       success: false,
-      error: 'Server not found. Please check the server name.',
+      error: error instanceof Error ? error.message : 'Authentication failed',
     };
   }
-
-  if (credentials.password === 'wrongpassword') {
-    return {
-      success: false,
-      error: 'Invalid username or password',
-    };
-  }
-
-  // Simulate random network errors (10% chance)
-  if (shouldFail(0.05)) {
-    return {
-      success: false,
-      error: 'Connection timeout. Please check your network and try again.',
-    };
-  }
-
-  // Generate mock session token
-  const sessionToken = `scto_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-  
-  // Store session
-  currentSession = {
-    token: sessionToken,
-    serverName: credentials.serverName,
-  };
-
-  return {
-    success: true,
-    sessionToken,
-    forms: mockForms,
-  };
 }
 
 /**
@@ -86,13 +62,7 @@ export async function authenticateSurveyCTO(
  * Headers: { Authorization: Bearer <sessionToken> }
  */
 export async function fetchForms(): Promise<SurveyCTOForm[]> {
-  await delay(500 + Math.random() * 500);
-
-  if (!currentSession) {
-    throw new Error('Not authenticated. Please log in first.');
-  }
-
-  return mockForms;
+  return apiRequest<SurveyCTOForm[]>('/api/surveycto/forms');
 }
 
 /**
@@ -102,32 +72,26 @@ export async function fetchForms(): Promise<SurveyCTOForm[]> {
  * GET /api/surveycto/forms/:formId
  */
 export async function fetchFormById(formId: string): Promise<SurveyCTOForm | null> {
-  await delay(300 + Math.random() * 300);
-
-  if (!currentSession) {
-    throw new Error('Not authenticated. Please log in first.');
-  }
-
-  return mockForms.find(form => form.id === formId) || null;
+  return apiRequest<SurveyCTOForm | null>(`/api/surveycto/forms/${encodeURIComponent(formId)}`);
 }
 
 /**
  * Logs out and clears the session
  */
 export function logout(): void {
-  currentSession = null;
+  setSessionToken(null);
 }
 
 /**
  * Checks if there's an active session
  */
 export function isAuthenticated(): boolean {
-  return currentSession !== null;
+  return getStoredSessionToken() !== null;
 }
 
 /**
  * Gets the current session token
  */
 export function getSessionToken(): string | null {
-  return currentSession?.token || null;
+  return getStoredSessionToken();
 }
