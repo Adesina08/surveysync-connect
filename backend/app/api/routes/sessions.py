@@ -5,7 +5,7 @@ from datetime import datetime
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
-from backend.app.services import surveycto_service
+from app.services import surveycto_service
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 

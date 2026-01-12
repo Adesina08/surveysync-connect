@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from backend.app.db.session import get_connection
-from backend.app.models.last_sync import LastSyncMetadata
-from backend.app.models.sync_job import SyncJob
+from app.db.session import get_connection
+from app.models.last_sync import LastSyncMetadata
+from app.models.sync_job import SyncJob
 
 
 def create_sync_job(name: str, source: str, target: str) -> SyncJob:
