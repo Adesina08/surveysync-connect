@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -11,22 +10,39 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
-import { Table, Plus, ArrowRight, Key, Layers, CheckCircle2 } from "lucide-react";
+import { Table, Plus, ArrowRight, Key, Layers, CheckCircle2, AlertTriangle } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useSyncContext } from "@/contexts/SyncContext";
 
 interface TableConfigurationProps {
   onContinue: () => void;
 }
 
-const mockSchemas = ["public", "staging", "analytics"];
-const mockTables = ["survey_responses", "household_data", "health_records", "education_metrics"];
-
 const TableConfiguration = ({ onContinue }: TableConfigurationProps) => {
-  const [tableMode, setTableMode] = useState<"existing" | "new">("existing");
-  const [schema, setSchema] = useState("");
-  const [selectedTable, setSelectedTable] = useState("");
-  const [newTableName, setNewTableName] = useState("");
-  const [syncMode, setSyncMode] = useState<"insert" | "upsert">("upsert");
+  const {
+    state,
+    setSelectedSchema,
+    setSelectedTable,
+    setCreateNewTable,
+    setNewTableName,
+    setSyncMode,
+  } = useSyncContext();
+
+  const {
+    schemas,
+    selectedSchema,
+    selectedTable,
+    createNewTable,
+    newTableName,
+    syncMode,
+    selectedForm,
+  } = state;
+
+  // Get tables for selected schema
+  const currentSchema = schemas.find(s => s.name === selectedSchema);
+  const tables = currentSchema?.tables || [];
+
+  const isValid = selectedSchema && (createNewTable ? newTableName.trim() : selectedTable);
 
   return (
     <Card className="w-full max-w-xl mx-auto shadow-card border-border/50 animate-fade-in">
@@ -42,14 +58,17 @@ const TableConfiguration = ({ onContinue }: TableConfigurationProps) => {
       <CardContent className="space-y-6">
         <div className="space-y-3">
           <Label className="text-sm font-medium">Schema</Label>
-          <Select value={schema} onValueChange={setSchema}>
+          <Select value={selectedSchema || ""} onValueChange={setSelectedSchema}>
             <SelectTrigger>
               <SelectValue placeholder="Select a schema" />
             </SelectTrigger>
             <SelectContent>
-              {mockSchemas.map((s) => (
-                <SelectItem key={s} value={s}>
-                  {s}
+              {schemas.map((s) => (
+                <SelectItem key={s.name} value={s.name}>
+                  {s.name}
+                  <span className="text-muted-foreground ml-2">
+                    ({s.tables.length} tables)
+                  </span>
                 </SelectItem>
               ))}
             </SelectContent>
@@ -60,17 +79,17 @@ const TableConfiguration = ({ onContinue }: TableConfigurationProps) => {
           <Label className="text-sm font-medium">Table Selection</Label>
           <div className="grid grid-cols-2 gap-3">
             <button
-              onClick={() => setTableMode("existing")}
+              onClick={() => setCreateNewTable(false)}
               className={cn(
                 "p-4 rounded-lg border text-left transition-all",
-                tableMode === "existing"
+                !createNewTable
                   ? "border-primary bg-primary/5 shadow-card"
                   : "border-border hover:border-primary/50"
               )}
             >
               <Layers className={cn(
                 "w-5 h-5 mb-2",
-                tableMode === "existing" ? "text-primary" : "text-muted-foreground"
+                !createNewTable ? "text-primary" : "text-muted-foreground"
               )} />
               <p className="font-medium text-sm">Use Existing Table</p>
               <p className="text-xs text-muted-foreground mt-1">
@@ -78,17 +97,17 @@ const TableConfiguration = ({ onContinue }: TableConfigurationProps) => {
               </p>
             </button>
             <button
-              onClick={() => setTableMode("new")}
+              onClick={() => setCreateNewTable(true)}
               className={cn(
                 "p-4 rounded-lg border text-left transition-all",
-                tableMode === "new"
+                createNewTable
                   ? "border-primary bg-primary/5 shadow-card"
                   : "border-border hover:border-primary/50"
               )}
             >
               <Plus className={cn(
                 "w-5 h-5 mb-2",
-                tableMode === "new" ? "text-primary" : "text-muted-foreground"
+                createNewTable ? "text-primary" : "text-muted-foreground"
               )} />
               <p className="font-medium text-sm">Create New Table</p>
               <p className="text-xs text-muted-foreground mt-1">
@@ -98,21 +117,33 @@ const TableConfiguration = ({ onContinue }: TableConfigurationProps) => {
           </div>
         </div>
 
-        {tableMode === "existing" ? (
+        {!createNewTable ? (
           <div className="space-y-3">
             <Label className="text-sm font-medium">Select Table</Label>
-            <Select value={selectedTable} onValueChange={setSelectedTable}>
-              <SelectTrigger>
-                <SelectValue placeholder="Choose a table" />
-              </SelectTrigger>
-              <SelectContent>
-                {mockTables.map((t) => (
-                  <SelectItem key={t} value={t}>
-                    {t}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            {tables.length === 0 && selectedSchema ? (
+              <div className="flex items-center gap-2 p-3 rounded-lg bg-muted/50 border border-border">
+                <AlertTriangle className="w-4 h-4 text-muted-foreground" />
+                <p className="text-sm text-muted-foreground">
+                  No tables in this schema. Create a new table instead.
+                </p>
+              </div>
+            ) : (
+              <Select value={selectedTable || ""} onValueChange={setSelectedTable}>
+                <SelectTrigger>
+                  <SelectValue placeholder="Choose a table" />
+                </SelectTrigger>
+                <SelectContent>
+                  {tables.map((t) => (
+                    <SelectItem key={t.name} value={t.name}>
+                      {t.name}
+                      <span className="text-muted-foreground ml-2">
+                        ({t.rowCount.toLocaleString()} rows)
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
             
             {selectedTable && (
               <div className="flex items-center gap-2 p-3 rounded-lg bg-success/10 border border-success/20 animate-fade-in">
@@ -134,9 +165,11 @@ const TableConfiguration = ({ onContinue }: TableConfigurationProps) => {
               value={newTableName}
               onChange={(e) => setNewTableName(e.target.value)}
             />
-            <p className="text-xs text-muted-foreground">
-              Table will be created with columns matching your SurveyCTO form fields
-            </p>
+            {selectedForm && (
+              <p className="text-xs text-muted-foreground">
+                Table will be created with {selectedForm.fields.length} columns matching your SurveyCTO form fields
+              </p>
+            )}
           </div>
         )}
 
@@ -176,7 +209,7 @@ const TableConfiguration = ({ onContinue }: TableConfigurationProps) => {
           size="lg"
           className="w-full"
           onClick={onContinue}
-          disabled={!schema || (tableMode === "existing" ? !selectedTable : !newTableName)}
+          disabled={!isValid}
         >
           Continue to Sync
           <ArrowRight className="w-4 h-4" />

@@ -11,34 +11,54 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Database, Server, User, Lock, Hash, ArrowRight, CheckCircle2, AlertCircle } from "lucide-react";
+import { connectPostgres } from "@/api/postgres";
+import { useSyncContext } from "@/contexts/SyncContext";
+import type { PostgresCredentials } from "@/api/types";
 
 interface DatabaseConnectionProps {
   onSuccess: () => void;
 }
 
 const DatabaseConnection = ({ onSuccess }: DatabaseConnectionProps) => {
+  const { setSchemas } = useSyncContext();
   const [host, setHost] = useState("");
   const [port, setPort] = useState("5432");
   const [database, setDatabase] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [sslMode, setSslMode] = useState<PostgresCredentials['sslMode']>("require");
   const [isConnecting, setIsConnecting] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<"idle" | "success" | "error">("idle");
+  const [error, setError] = useState<string | null>(null);
 
   const handleConnect = async () => {
     setIsConnecting(true);
     setConnectionStatus("idle");
-    
-    // Simulate connection test
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-    
+    setError(null);
+
+    const response = await connectPostgres({
+      host: host.trim(),
+      port: parseInt(port, 10) || 5432,
+      database: database.trim(),
+      username: username.trim(),
+      password,
+      sslMode,
+    });
+
     setIsConnecting(false);
-    setConnectionStatus("success");
-    
-    // Auto-proceed after success
-    setTimeout(() => {
-      onSuccess();
-    }, 1000);
+
+    if (response.success && response.schemas) {
+      setConnectionStatus("success");
+      setSchemas(response.schemas);
+      
+      // Auto-proceed after success
+      setTimeout(() => {
+        onSuccess();
+      }, 1000);
+    } else {
+      setConnectionStatus("error");
+      setError(response.error || 'Connection failed');
+    }
   };
 
   return (
@@ -138,15 +158,14 @@ const DatabaseConnection = ({ onSuccess }: DatabaseConnectionProps) => {
 
         <div className="space-y-2">
           <Label className="text-sm font-medium">SSL Mode</Label>
-          <Select defaultValue="require">
+          <Select value={sslMode} onValueChange={(v) => setSslMode(v as PostgresCredentials['sslMode'])}>
             <SelectTrigger>
               <SelectValue placeholder="Select SSL mode" />
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="disable">Disable</SelectItem>
+              <SelectItem value="prefer">Prefer</SelectItem>
               <SelectItem value="require">Require</SelectItem>
-              <SelectItem value="verify-ca">Verify CA</SelectItem>
-              <SelectItem value="verify-full">Verify Full</SelectItem>
             </SelectContent>
           </Select>
         </div>
@@ -160,12 +179,10 @@ const DatabaseConnection = ({ onSuccess }: DatabaseConnectionProps) => {
           </div>
         )}
 
-        {connectionStatus === "error" && (
+        {connectionStatus === "error" && error && (
           <div className="flex items-center gap-2 p-3 rounded-lg bg-destructive/10 border border-destructive/20">
-            <AlertCircle className="w-5 h-5 text-destructive" />
-            <p className="text-sm text-destructive font-medium">
-              Connection failed. Please check your credentials.
-            </p>
+            <AlertCircle className="w-5 h-5 text-destructive flex-shrink-0" />
+            <p className="text-sm text-destructive">{error}</p>
           </div>
         )}
 
