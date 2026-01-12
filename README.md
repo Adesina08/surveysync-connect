@@ -1,73 +1,105 @@
-# Welcome to your Lovable project
+# SurveySync Connect
 
-## Project info
+SurveySync Connect is a SurveyCTO → PostgreSQL synchronization platform that lets research teams authenticate to a SurveyCTO server, select a form, map it to a PostgreSQL table, and run a managed sync job with progress tracking.
 
-**URL**: https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID
+**Project home**: https://surveysync-connect.example.com
 
-## How can I edit this code?
+## What this repo contains
 
-There are several ways of editing your application.
+- **Frontend (this repo)**: A Vite + React UI for configuring connections, mapping tables, and monitoring sync jobs.
+- **Backend (API + worker)**: A service that handles SurveyCTO sessions, PostgreSQL connections, schema validation, and long-running sync jobs.
 
-**Use Lovable**
+## Local development
 
-Simply visit the [Lovable Project](https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID) and start prompting.
-
-Changes made via Lovable will be committed automatically to this repo.
-
-**Use your preferred IDE**
-
-If you want to work locally using your own IDE, you can clone this repo and push changes. Pushed changes will also be reflected in Lovable.
-
-The only requirement is having Node.js & npm installed - [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating)
-
-Follow these steps:
+### Frontend (UI)
 
 ```sh
-# Step 1: Clone the repository using the project's Git URL.
-git clone <YOUR_GIT_URL>
-
-# Step 2: Navigate to the project directory.
-cd <YOUR_PROJECT_NAME>
-
-# Step 3: Install the necessary dependencies.
-npm i
-
-# Step 4: Start the development server with auto-reloading and an instant preview.
+npm install
 npm run dev
 ```
 
-**Edit a file directly in GitHub**
+The UI starts on `http://localhost:5173` by default.
 
-- Navigate to the desired file(s).
-- Click the "Edit" button (pencil icon) at the top right of the file view.
-- Make your changes and commit the changes.
+### Backend (API + worker)
 
-**Use GitHub Codespaces**
+Run your backend service separately. The UI expects a REST API with the routes listed below. If you are running the API locally, make sure it is reachable (for example `http://localhost:4000`) and configure the frontend with `VITE_API_BASE_URL`.
 
-- Navigate to the main page of your repository.
-- Click on the "Code" button (green button) near the top right.
-- Select the "Codespaces" tab.
-- Click on "New codespace" to launch a new Codespace environment.
-- Edit files directly within the Codespace and commit and push your changes once you're done.
+## Environment variables
 
-## What technologies are used for this project?
+### Frontend
 
-This project is built with:
+Create a `.env.local` file (or set environment variables in your shell):
+
+```bash
+VITE_API_BASE_URL=http://localhost:4000
+VITE_APP_ENV=local
+```
+
+### Backend
+
+These variables are expected by the API service (adjust as needed for your implementation):
+
+```bash
+# SurveyCTO
+SURVEYCTO_SERVER=https://your-server.surveycto.com
+SURVEYCTO_USERNAME=your-username
+SURVEYCTO_PASSWORD=your-password
+
+# PostgreSQL
+PGHOST=localhost
+PGPORT=5432
+PGDATABASE=surveysync
+PGUSER=surveysync
+PGPASSWORD=surveysync
+PGSSLMODE=prefer
+
+# App
+API_PORT=4000
+SYNC_JOB_POLL_INTERVAL_MS=1000
+```
+
+## High-level architecture
+
+1. **Frontend (React/Vite)** collects SurveyCTO credentials, form selection, and PostgreSQL targets.
+2. **Backend API** authenticates SurveyCTO sessions, lists forms, and validates PostgreSQL schema compatibility.
+3. **Sync worker** starts a sync job, pulls data from SurveyCTO, writes to PostgreSQL (insert or upsert), and emits progress updates.
+4. **PostgreSQL** stores the synced form data in existing or newly created tables.
+
+## Key API routes
+
+The UI expects the following API endpoints:
+
+### SurveyCTO
+- `POST /api/sessions/surveycto` — authenticate and return available forms.
+- `GET /api/surveycto/forms` — list forms for the current session.
+- `GET /api/surveycto/forms/:formId` — fetch a single form with field metadata.
+
+### PostgreSQL
+- `POST /api/pg/connect` — test connection and return schemas.
+- `GET /api/pg/schemas` — list schemas.
+- `GET /api/pg/schemas/:schemaName/tables` — list tables for a schema.
+- `POST /api/pg/validate-schema` — validate field compatibility and primary key mapping.
+- `POST /api/pg/tables` — create a new table from SurveyCTO fields.
+
+### Sync jobs
+- `POST /api/sync-jobs` — start a sync job.
+- `GET /api/sync-jobs/:jobId` — read sync progress.
+- `DELETE /api/sync-jobs/:jobId` — cancel a running job.
+
+## Sync flow (SurveyCTO → PostgreSQL)
+
+1. **Authenticate** to SurveyCTO (`POST /api/sessions/surveycto`).
+2. **Select a form** (`GET /api/surveycto/forms`).
+3. **Connect to PostgreSQL** (`POST /api/pg/connect`).
+4. **Choose target table** or create a new one (`GET /api/pg/schemas`, `GET /api/pg/schemas/:schemaName/tables`, `POST /api/pg/tables`).
+5. **Validate schema compatibility** (`POST /api/pg/validate-schema`).
+6. **Start sync** (`POST /api/sync-jobs`) with insert or upsert mode.
+7. **Track progress** via polling (`GET /api/sync-jobs/:jobId`) until completion or cancellation (`DELETE /api/sync-jobs/:jobId`).
+
+## Tech stack
 
 - Vite
-- TypeScript
 - React
+- TypeScript
 - shadcn-ui
 - Tailwind CSS
-
-## How can I deploy this project?
-
-Simply open [Lovable](https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID) and click on Share -> Publish.
-
-## Can I connect a custom domain to my Lovable project?
-
-Yes, you can!
-
-To connect a domain, navigate to Project > Settings > Domains and click Connect Domain.
-
-Read more here: [Setting up a custom domain](https://docs.lovable.dev/features/custom-domain#custom-domain)
