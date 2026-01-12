@@ -3,25 +3,42 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Lock, Server, User, ArrowRight, Shield } from "lucide-react";
+import { Lock, Server, User, ArrowRight, Shield, AlertCircle } from "lucide-react";
+import { authenticateSurveyCTO } from "@/api/surveycto";
+import { useSyncContext } from "@/contexts/SyncContext";
 
 interface SurveyCTOLoginProps {
   onSuccess: () => void;
 }
 
 const SurveyCTOLogin = ({ onSuccess }: SurveyCTOLoginProps) => {
+  const { setSessionToken, setForms } = useSyncContext();
   const [serverName, setServerName] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsLoading(true);
-    // Simulate API call
-    await new Promise((resolve) => setTimeout(resolve, 1500));
+    setError(null);
+
+    const response = await authenticateSurveyCTO({
+      serverName: serverName.trim(),
+      username: username.trim(),
+      password,
+    });
+
     setIsLoading(false);
-    onSuccess();
+
+    if (response.success && response.sessionToken && response.forms) {
+      setSessionToken(response.sessionToken);
+      setForms(response.forms);
+      onSuccess();
+    } else {
+      setError(response.error || 'Authentication failed');
+    }
   };
 
   return (
@@ -92,8 +109,15 @@ const SurveyCTOLogin = ({ onSuccess }: SurveyCTOLoginProps) => {
             </div>
           </div>
 
+          {error && (
+            <div className="flex items-center gap-2 p-3 rounded-lg bg-destructive/10 border border-destructive/20">
+              <AlertCircle className="w-4 h-4 text-destructive flex-shrink-0" />
+              <p className="text-sm text-destructive">{error}</p>
+            </div>
+          )}
+
           <div className="flex items-center gap-2 p-3 rounded-lg bg-muted/50 border border-border/50">
-            <Shield className="w-4 h-4 text-success" />
+            <Shield className="w-4 h-4 text-success flex-shrink-0" />
             <p className="text-xs text-muted-foreground">
               Your credentials are encrypted and never stored on our servers
             </p>

@@ -6,6 +6,7 @@ import FormSelector from "@/components/sync/FormSelector";
 import DatabaseConnection from "@/components/sync/DatabaseConnection";
 import TableConfiguration from "@/components/sync/TableConfiguration";
 import SyncExecution from "@/components/sync/SyncExecution";
+import { SyncProvider } from "@/contexts/SyncContext";
 
 const steps = [
   { id: 1, title: "Connect", description: "SurveyCTO login" },
@@ -15,7 +16,7 @@ const steps = [
   { id: 5, title: "Sync", description: "Execute transfer" },
 ];
 
-const Index = () => {
+const IndexContent = () => {
   const [currentStep, setCurrentStep] = useState(1);
 
   const handleRestart = () => {
@@ -81,6 +82,14 @@ const Index = () => {
         </footer>
       </main>
     </div>
+  );
+};
+
+const Index = () => {
+  return (
+    <SyncProvider>
+      <IndexContent />
+    </SyncProvider>
   );
 };
 
