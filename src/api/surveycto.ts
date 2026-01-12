@@ -2,12 +2,62 @@ import type { SurveyCTOCredentials, SurveyCTOAuthResponse, SurveyCTOForm } from 
 import { apiRequest } from './http';
 import { getSessionToken as getStoredSessionToken, setSessionToken } from './session';
 
+type SurveyCTOSessionResponse = {
+  session_token: string;
+  expires_at: string;
+};
+
+type SurveyCTOFormResponse = {
+  form_id: string;
+  title: string;
+  version: string;
+};
+
+function normalizeServerUrl(serverName: string): string {
+  let normalized = serverName.trim();
+  if (!normalized) {
+    return normalized;
+  }
+
+  if (!normalized.includes('.')) {
+    normalized = `${normalized}.surveycto.com`;
+  }
+
+  if (!/^https?:\/\//i.test(normalized)) {
+    normalized = `https://${normalized}`;
+  }
+
+  return normalized;
+}
+
+function normalizeVersion(version: string | undefined): string {
+  if (!version) {
+    return '1';
+  }
+  const trimmed = version.trim();
+  if (!trimmed) {
+    return '1';
+  }
+  return trimmed.toLowerCase().startsWith('v') ? trimmed.slice(1) || '1' : trimmed;
+}
+
+function mapForm(form: SurveyCTOFormResponse): SurveyCTOForm {
+  return {
+    id: form.form_id,
+    name: form.title,
+    version: normalizeVersion(form.version),
+    responses: 0,
+    lastUpdated: 'Unknown',
+    fields: [],
+  };
+}
+
 /**
  * Authenticates with SurveyCTO server and returns available forms
  * 
  * Real implementation would call:
- * POST /api/sessions/surveycto
- * Body: { serverName, username, password }
+ * POST /sessions
+ * Body: { server_url, username, password }
  */
 export async function authenticateSurveyCTO(
   credentials: SurveyCTOCredentials
@@ -34,18 +84,37 @@ export async function authenticateSurveyCTO(
     };
   }
 
+  const serverUrl = normalizeServerUrl(credentials.serverName);
+
   try {
-    const response = await apiRequest<SurveyCTOAuthResponse>('/api/sessions/surveycto', {
+    const session = await apiRequest<SurveyCTOSessionResponse>('/sessions', {
       method: 'POST',
       auth: false,
-      body: JSON.stringify(credentials),
+      body: JSON.stringify({
+        username: credentials.username,
+        password: credentials.password,
+        server_url: serverUrl,
+      }),
     });
 
-    if (response.success && response.sessionToken) {
-      setSessionToken(response.sessionToken);
+    if (!session.session_token) {
+      return {
+        success: false,
+        error: 'Authentication failed',
+      };
     }
 
-    return response;
+    setSessionToken(session.session_token);
+
+    const forms = await apiRequest<SurveyCTOFormResponse[]>(
+      `/surveycto/forms?session_token=${encodeURIComponent(session.session_token)}`
+    );
+
+    return {
+      success: true,
+      sessionToken: session.session_token,
+      forms: forms.map(mapForm),
+    };
   } catch (error) {
     return {
       success: false,
@@ -58,21 +127,28 @@ export async function authenticateSurveyCTO(
  * Fetches forms for the current session
  * 
  * Real implementation would call:
- * GET /api/surveycto/forms
- * Headers: { Authorization: Bearer <sessionToken> }
+ * GET /surveycto/forms?session_token=...
  */
 export async function fetchForms(): Promise<SurveyCTOForm[]> {
-  return apiRequest<SurveyCTOForm[]>('/api/surveycto/forms');
+  const token = getStoredSessionToken();
+  if (!token) {
+    return [];
+  }
+  const forms = await apiRequest<SurveyCTOFormResponse[]>(
+    `/surveycto/forms?session_token=${encodeURIComponent(token)}`
+  );
+  return forms.map(mapForm);
 }
 
 /**
  * Fetches a single form by ID with full field details
  * 
  * Real implementation would call:
- * GET /api/surveycto/forms/:formId
+ * GET /surveycto/forms
  */
 export async function fetchFormById(formId: string): Promise<SurveyCTOForm | null> {
-  return apiRequest<SurveyCTOForm | null>(`/api/surveycto/forms/${encodeURIComponent(formId)}`);
+  const forms = await fetchForms();
+  return forms.find((form) => form.id === formId) ?? null;
 }
 
 /**
