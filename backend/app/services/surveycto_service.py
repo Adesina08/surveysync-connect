@@ -99,9 +99,16 @@ def create_session(username: str, password: str, server_url: str) -> SessionInfo
 
 async def _fetch_form_list(session: SessionInfo) -> str:
     form_list_url = f"{session.server_url}/formList"
-    headers = {"X-OpenRosa-Version": "1.0", "Accept": "text/xml"}
+    headers = {
+        "X-OpenRosa-Version": "1.0",
+        "Accept": "text/xml, application/xml",
+        "User-Agent": "SurveySync Connect",
+    }
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0),
+            follow_redirects=True,
+        ) as client:
             response = await client.get(
                 form_list_url,
                 auth=(session.username, session.password),
