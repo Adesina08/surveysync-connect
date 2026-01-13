@@ -51,8 +51,9 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
     const messageFromPayload =
       typeof payload === 'string'
         ? payload
-        : (payload as { message?: string; error?: string } | null)?.message ||
-          (payload as { message?: string; error?: string } | null)?.error;
+        : (payload as { message?: string; error?: string; detail?: string } | null)?.message ||
+          (payload as { message?: string; error?: string; detail?: string } | null)?.error ||
+          (payload as { message?: string; error?: string; detail?: string } | null)?.detail;
     const statusMessage = response.statusText || `HTTP ${response.status}`;
     const message = messageFromPayload || statusMessage;
     const isMissingApiBase = !API_BASE_URL && response.status === 404;
