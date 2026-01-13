@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict
+from typing import Dict, Iterable
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ElementTree
 
@@ -41,7 +41,9 @@ class AuthenticationError(SurveyCTOServiceError):
 
 
 class ApiAccessError(SurveyCTOServiceError):
-    pass
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class ServerConnectionError(SurveyCTOServiceError):
@@ -120,13 +122,56 @@ async def _fetch_form_list(session: SessionInfo) -> str:
     if response.status_code in {401, 403}:
         raise AuthenticationError("SurveyCTO credentials are invalid or access is denied.")
     if response.status_code == 404:
-        raise ApiAccessError("SurveyCTO form list endpoint was not found on this server.")
+        raise ApiAccessError(
+            "SurveyCTO form list endpoint was not found on this server.",
+            status_code=response.status_code,
+        )
     if response.status_code >= 400:
         raise ApiAccessError(
-            f"SurveyCTO form list request failed with status {response.status_code}."
+            f"SurveyCTO form list request failed with status {response.status_code}.",
+            status_code=response.status_code,
         )
 
     return response.text
+
+
+async def _fetch_form_ids(session: SessionInfo) -> Iterable[str]:
+    form_ids_url = f"{session.server_url}/api/v2/forms/ids"
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "SurveySync Connect",
+    }
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0),
+            follow_redirects=True,
+        ) as client:
+            response = await client.get(
+                form_ids_url,
+                auth=(session.username, session.password),
+                headers=headers,
+            )
+    except httpx.RequestError as exc:
+        raise ServerConnectionError("Unable to reach the SurveyCTO server.") from exc
+
+    if response.status_code in {401, 403}:
+        raise AuthenticationError("SurveyCTO credentials are invalid or access is denied.")
+    if response.status_code == 404:
+        raise ApiAccessError(
+            "SurveyCTO forms ids endpoint was not found on this server.",
+            status_code=response.status_code,
+        )
+    if response.status_code >= 400:
+        raise ApiAccessError(
+            f"SurveyCTO forms ids request failed with status {response.status_code}.",
+            status_code=response.status_code,
+        )
+
+    payload = response.json()
+    form_ids = payload.get("formIds")
+    if not isinstance(form_ids, list):
+        raise FormListParseError("Unable to parse SurveyCTO form ids response.")
+    return [str(form_id).strip() for form_id in form_ids if str(form_id).strip()]
 
 
 async def list_forms(session_token: str) -> list[SurveyCTOForm]:
@@ -134,5 +179,19 @@ async def list_forms(session_token: str) -> list[SurveyCTOForm]:
     if not session:
         raise InvalidSessionError("Session token is invalid or expired.")
 
-    xml_payload = await _fetch_form_list(session)
-    return _parse_form_list(xml_payload)
+    try:
+        xml_payload = await _fetch_form_list(session)
+        return _parse_form_list(xml_payload)
+    except ApiAccessError as exc:
+        if exc.status_code not in {404, 412}:
+            raise
+
+    form_ids = await _fetch_form_ids(session)
+    return [
+        SurveyCTOForm(
+            form_id=form_id,
+            title=form_id,
+            version="",
+        )
+        for form_id in form_ids
+    ]
