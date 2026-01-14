@@ -1,8 +1,8 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
-
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
 @layer base {
   :root {
@@ -16,8 +16,8 @@
     --popover: 0 0% 100%;
     --popover-foreground: 215 25% 15%;
 
-    /* Primary: Deep teal for trust */
-    --primary: 190 70% 30%;
+    /* Primary: Brand cyan */
+    --primary: 196 100% 47%;
     --primary-foreground: 0 0% 100%;
 
     /* Secondary: Slate gray */
@@ -27,8 +27,8 @@
     --muted: 215 15% 95%;
     --muted-foreground: 215 15% 45%;
 
-    /* Accent: Teal highlight */
-    --accent: 175 60% 45%;
+    /* Accent: Brand cyan highlight */
+    --accent: 196 100% 47%;
     --accent-foreground: 0 0% 100%;
 
     /* Success: Emerald */
@@ -44,12 +44,12 @@
 
     --border: 215 20% 88%;
     --input: 215 20% 88%;
-    --ring: 190 70% 30%;
+    --ring: 196 100% 47%;
 
     --radius: 0.625rem;
 
     /* Custom gradients */
-    --gradient-primary: linear-gradient(135deg, hsl(190 70% 30%) 0%, hsl(175 60% 35%) 100%);
+    --gradient-primary: linear-gradient(135deg, hsl(196 100% 47%) 0%, hsl(196 100% 40%) 100%);
     --gradient-hero: linear-gradient(135deg, hsl(215 30% 15%) 0%, hsl(200 40% 20%) 50%, hsl(190 50% 25%) 100%);
     --gradient-card: linear-gradient(180deg, hsl(0 0% 100%) 0%, hsl(210 20% 98%) 100%);
 
@@ -61,12 +61,12 @@
 
     --sidebar-background: 215 30% 12%;
     --sidebar-foreground: 210 20% 90%;
-    --sidebar-primary: 175 60% 50%;
+    --sidebar-primary: 196 100% 47%;
     --sidebar-primary-foreground: 0 0% 100%;
     --sidebar-accent: 215 25% 18%;
     --sidebar-accent-foreground: 210 20% 90%;
     --sidebar-border: 215 25% 20%;
-    --sidebar-ring: 175 60% 50%;
+    --sidebar-ring: 196 100% 47%;
   }
 
   .dark {
@@ -79,7 +79,7 @@
     --popover: 215 25% 12%;
     --popover-foreground: 210 20% 95%;
 
-    --primary: 175 60% 50%;
+    --primary: 196 100% 47%;
     --primary-foreground: 215 30% 10%;
 
     --secondary: 215 20% 18%;
@@ -88,7 +88,7 @@
     --muted: 215 20% 16%;
     --muted-foreground: 215 15% 55%;
 
-    --accent: 175 60% 45%;
+    --accent: 196 100% 47%;
     --accent-foreground: 215 30% 10%;
 
     --success: 160 60% 45%;
@@ -102,9 +102,9 @@
 
     --border: 215 20% 20%;
     --input: 215 20% 20%;
-    --ring: 175 60% 50%;
+    --ring: 196 100% 47%;
 
-    --gradient-primary: linear-gradient(135deg, hsl(175 60% 45%) 0%, hsl(190 70% 40%) 100%);
+    --gradient-primary: linear-gradient(135deg, hsl(196 100% 47%) 0%, hsl(196 100% 40%) 100%);
     --gradient-hero: linear-gradient(135deg, hsl(215 30% 6%) 0%, hsl(200 35% 10%) 50%, hsl(190 40% 15%) 100%);
     --gradient-card: linear-gradient(180deg, hsl(215 25% 12%) 0%, hsl(215 25% 10%) 100%);
 
@@ -115,12 +115,12 @@
 
     --sidebar-background: 215 30% 6%;
     --sidebar-foreground: 210 20% 90%;
-    --sidebar-primary: 175 60% 50%;
+    --sidebar-primary: 196 100% 47%;
     --sidebar-primary-foreground: 215 30% 10%;
     --sidebar-accent: 215 25% 12%;
     --sidebar-accent-foreground: 210 20% 90%;
     --sidebar-border: 215 25% 15%;
-    --sidebar-ring: 175 60% 50%;
+    --sidebar-ring: 196 100% 47%;
   }
 }
 

@@ -46,10 +46,10 @@ const IndexContent = () => {
   };
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="min-h-screen bg-background flex flex-col">
       <Header />
-      
-      <main className="container mx-auto px-6 py-8">
+
+      <main className="container mx-auto flex-1 px-6 py-8">
         {/* Hero Section for Step 1 */}
         {currentStep === 1 && (
           <div className="text-center mb-12 animate-fade-in">
@@ -82,11 +82,12 @@ const IndexContent = () => {
           {renderStepContent()}
         </div>
 
-        {/* Footer */}
-        <footer className="text-center text-sm text-muted-foreground py-8 border-t border-border">
-          <p>© 2026 InicioNG Tech Team</p>
-        </footer>
       </main>
+
+      {/* Footer */}
+      <footer className="text-center text-sm text-muted-foreground py-8 border-t border-border mt-auto">
+        <p>© 2026 InicioNG Tech Team</p>
+      </footer>
     </div>
   );
 };
