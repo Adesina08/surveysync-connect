@@ -97,11 +97,11 @@ const FormSelector = ({ onSelect }: FormSelectorProps) => {
                       <div className="flex items-center gap-4">
                         <span className="flex items-center gap-1 text-xs text-muted-foreground">
                           <Hash className="w-3 h-3" />
-                          {form.responses.toLocaleString()} responses
+                          {form.responses >= 0 ? `${form.responses.toLocaleString()} responses` : "Responses: Unknown"}
                         </span>
                         <span className="flex items-center gap-1 text-xs text-muted-foreground">
                           <Columns className="w-3 h-3" />
-                          {form.fields.length} fields
+                          {form.fields.length > 0 ? `${form.fields.length} fields` : "Fields: Unknown"}
                         </span>
                         <span className="flex items-center gap-1 text-xs text-muted-foreground">
                           <Calendar className="w-3 h-3" />
