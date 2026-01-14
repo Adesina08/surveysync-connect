@@ -93,6 +93,7 @@ const FormSelector = ({ onSelect }: FormSelectorProps) => {
                     </div>
                     <div>
                       <h3 className="font-medium text-foreground">{form.name}</h3>
+                      <p className="text-xs text-muted-foreground">ID: {form.id}</p>
                       <p className="text-xs text-muted-foreground mb-1">v{form.version}</p>
                       <div className="flex items-center gap-4">
                         <span className="flex items-center gap-1 text-xs text-muted-foreground">
