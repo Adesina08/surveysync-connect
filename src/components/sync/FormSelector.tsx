@@ -93,16 +93,15 @@ const FormSelector = ({ onSelect }: FormSelectorProps) => {
                     </div>
                     <div>
                       <h3 className="font-medium text-foreground">{form.name}</h3>
-                      <p className="text-xs text-muted-foreground">ID: {form.id}</p>
                       <p className="text-xs text-muted-foreground mb-1">v{form.version}</p>
                       <div className="flex items-center gap-4">
                         <span className="flex items-center gap-1 text-xs text-muted-foreground">
                           <Hash className="w-3 h-3" />
-                          {form.responses >= 0 ? `${form.responses.toLocaleString()} responses` : "Responses: Unknown"}
+                          {form.responses > 0 ? `${form.responses.toLocaleString()} responses` : "Responses: Unavailable"}
                         </span>
                         <span className="flex items-center gap-1 text-xs text-muted-foreground">
                           <Columns className="w-3 h-3" />
-                          {form.fields.length > 0 ? `${form.fields.length} fields` : "Fields: Unknown"}
+                          {form.fields.length > 0 ? `${form.fields.length} fields` : "Fields: Unavailable"}
                         </span>
                         <span className="flex items-center gap-1 text-xs text-muted-foreground">
                           <Calendar className="w-3 h-3" />

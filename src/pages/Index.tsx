@@ -66,7 +66,15 @@ const IndexContent = () => {
 
         {/* Step Indicator */}
         <div className="max-w-3xl mx-auto mb-12">
-          <StepIndicator steps={steps} currentStep={currentStep} />
+          <StepIndicator
+            steps={steps}
+            currentStep={currentStep}
+            onStepClick={(stepId) => {
+              if (stepId < currentStep) {
+                setCurrentStep(stepId);
+              }
+            }}
+          />
         </div>
 
         {/* Step Content */}

@@ -10,15 +10,24 @@ interface Step {
 interface StepIndicatorProps {
   steps: Step[];
   currentStep: number;
+  onStepClick?: (stepId: number) => void;
 }
 
-const StepIndicator = ({ steps, currentStep }: StepIndicatorProps) => {
+const StepIndicator = ({ steps, currentStep, onStepClick }: StepIndicatorProps) => {
   return (
     <div className="w-full">
       <div className="flex items-center justify-between">
         {steps.map((step, index) => (
           <div key={step.id} className="flex items-center flex-1">
-            <div className="flex flex-col items-center">
+            <button
+              type="button"
+              onClick={() => onStepClick?.(step.id)}
+              disabled={step.id > currentStep}
+              className={cn(
+                "flex flex-col items-center rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary group",
+                step.id < currentStep && "cursor-pointer"
+              )}
+            >
               <div
                 className={cn(
                   "w-10 h-10 rounded-full flex items-center justify-center text-sm font-medium transition-all duration-300",
@@ -26,7 +35,8 @@ const StepIndicator = ({ steps, currentStep }: StepIndicatorProps) => {
                     ? "bg-success text-success-foreground"
                     : currentStep === step.id
                     ? "gradient-primary text-primary-foreground shadow-card animate-pulse-glow"
-                    : "bg-muted text-muted-foreground"
+                    : "bg-muted text-muted-foreground",
+                  step.id < currentStep && "group-hover:shadow-card"
                 )}
               >
                 {currentStep > step.id ? (
@@ -50,7 +60,7 @@ const StepIndicator = ({ steps, currentStep }: StepIndicatorProps) => {
                   {step.description}
                 </p>
               </div>
-            </div>
+            </button>
             {index < steps.length - 1 && (
               <div
                 className={cn(
