@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 from app.services import sync_engine
 
-router = APIRouter(prefix="/sync-jobs", tags=["sync-jobs"])
+router = APIRouter(prefix="/api/sync-jobs", tags=["sync-jobs"])
 
 
 class SyncJobCreateRequest(BaseModel):
