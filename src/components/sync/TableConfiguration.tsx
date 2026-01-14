@@ -167,7 +167,9 @@ const TableConfiguration = ({ onContinue }: TableConfigurationProps) => {
             />
             {selectedForm && (
               <p className="text-xs text-muted-foreground">
-                Table will be created with {selectedForm.fields.length} columns matching your SurveyCTO form fields
+                {selectedForm.fields.length > 0
+                  ? `Table will be created with ${selectedForm.fields.length} columns matching your SurveyCTO form fields`
+                  : "Form field details will load during sync when available."}
               </p>
             )}
           </div>
