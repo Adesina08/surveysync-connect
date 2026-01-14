@@ -155,6 +155,8 @@ async def _fetch_form_list(session: SessionInfo) -> str:
 async def _fetch_form_ids(session: SessionInfo) -> Iterable[str]:
     """
     SurveyCTO Server API v2 endpoint: /api/v2/forms/ids
+
+    Robust against unexpected JSON shapes (prevents AttributeError).
     """
     form_ids_url = f"{session.server_url}/api/v2/forms/ids"
     headers = {
@@ -188,16 +190,35 @@ async def _fetch_form_ids(session: SessionInfo) -> Iterable[str]:
             status_code=response.status_code,
         )
 
+    # ---- Robust JSON parsing + shape validation ----
     try:
         payload = response.json()
     except ValueError as exc:
-        raise FormListParseError("Unable to parse SurveyCTO form ids response (invalid JSON).") from exc
+        snippet = (response.text or "")[:300]
+        raise FormListParseError(
+            "SurveyCTO forms ids returned invalid JSON. "
+            f"content-type={response.headers.get('content-type')} snippet={snippet!r}"
+        ) from exc
 
-    form_ids = payload.get("formIds")
-    if not isinstance(form_ids, list):
-        raise FormListParseError("Unable to parse SurveyCTO form ids response.")
+    # Expected: {"formIds": [...]}
+    if isinstance(payload, dict):
+        form_ids = payload.get("formIds")
+        if isinstance(form_ids, list):
+            return [str(x).strip() for x in form_ids if str(x).strip()]
 
-    return [str(form_id).strip() for form_id in form_ids if str(form_id).strip()]
+        # Sometimes APIs return an error object; surface it if present
+        if "error" in payload:
+            raise ApiAccessError(f"SurveyCTO API error: {payload.get('error')}")
+
+        raise FormListParseError(
+            f"SurveyCTO forms ids response missing 'formIds' list. Keys={list(payload.keys())}"
+        )
+
+    # Some systems might return a bare list of ids
+    if isinstance(payload, list):
+        return [str(x).strip() for x in payload if str(x).strip()]
+
+    raise FormListParseError(f"Unexpected JSON type from forms ids: {type(payload).__name__}")
 
 
 async def list_forms(session_token: str) -> list[SurveyCTOForm]:
@@ -217,7 +238,7 @@ async def list_forms(session_token: str) -> list[SurveyCTOForm]:
         return [
             SurveyCTOForm(
                 form_id=form_id,
-                title=form_id,   # API returns only IDs here; use ID as title
+                title=form_id,  # API returns only IDs here; use ID as title
                 version="",
             )
             for form_id in form_ids
