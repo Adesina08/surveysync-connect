@@ -1,26 +1,28 @@
 from __future__ import annotations
 
+import os
 import sqlite3
-from pathlib import Path
+from contextlib import contextmanager
 
-DB_PATH = Path(__file__).resolve().parent / "internal.db"
-
-
-def get_connection() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    return connection
+DB_PATH = os.getenv("DATABASE_URL", "app.db").replace("sqlite:///", "")
 
 
-def _column_exists(connection: sqlite3.Connection, table: str, column: str) -> bool:
-    rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
-    return any(r["name"] == column for r in rows)
+def _ensure_columns(connection: sqlite3.Connection) -> None:
+    """
+    Lightweight migrations for SQLite.
+    """
+    # Add config_json if missing
+    try:
+        connection.execute("ALTER TABLE sync_jobs ADD COLUMN config_json TEXT")
+        connection.commit()
+    except sqlite3.OperationalError:
+        # Column already exists
+        pass
 
 
 def init_db() -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with get_connection() as connection:
-        # Base tables
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.row_factory = sqlite3.Row
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS sync_jobs (
@@ -31,7 +33,8 @@ def init_db() -> None:
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                last_error TEXT
+                last_error TEXT,
+                config_json TEXT
             )
             """
         )
@@ -46,10 +49,16 @@ def init_db() -> None:
             )
             """
         )
-
-        # ---- Migration: add config_json column if missing ----
-        # Safe to run on every startup.
-        if not _column_exists(connection, "sync_jobs", "config_json"):
-            connection.execute("ALTER TABLE sync_jobs ADD COLUMN config_json TEXT")
-
         connection.commit()
+
+        _ensure_columns(connection)
+
+
+@contextmanager
+def get_connection():
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    try:
+        yield connection
+    finally:
+        connection.close()
