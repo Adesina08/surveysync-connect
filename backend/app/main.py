@@ -4,8 +4,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import postgres, sessions, surveycto, sync_jobs
 from app.db.session import init_db
 
-app.include_router(postgres.router)
-
 app = FastAPI(title="SurveySync Connect Backend")
 
 app.add_middleware(
