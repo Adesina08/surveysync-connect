@@ -84,9 +84,7 @@ const IndexContent = () => {
 
         {/* Footer */}
         <footer className="text-center text-sm text-muted-foreground py-8 border-t border-border">
-          <p>
-            DataSync Platform • Secure data synchronization for research teams
-          </p>
+          <p>© 2026 InicioNG Tech Team</p>
         </footer>
       </main>
     </div>
