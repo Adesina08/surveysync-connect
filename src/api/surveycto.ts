@@ -44,13 +44,14 @@ function normalizeVersion(version: string | undefined): string {
 function mapForm(form: SurveyCTOFormResponse): SurveyCTOForm {
   return {
     id: form.form_id,
-    name: form.title,
+    name: form.title,           // <-- title comes from backend
     version: normalizeVersion(form.version),
-    responses: 0,
-    lastUpdated: 'Unknown',
-    fields: [],
+    responses: -1,              // <-- unknown
+    lastUpdated: "Unknown",
+    fields: [],                 // <-- unknown; don’t treat as 0
   };
 }
+
 
 /**
  * Authenticates with SurveyCTO server and returns available forms
