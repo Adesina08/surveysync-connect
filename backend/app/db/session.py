@@ -12,9 +12,15 @@ def get_connection() -> sqlite3.Connection:
     return connection
 
 
+def _column_exists(connection: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r["name"] == column for r in rows)
+
+
 def init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with get_connection() as connection:
+        # Base tables
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS sync_jobs (
@@ -40,4 +46,10 @@ def init_db() -> None:
             )
             """
         )
+
+        # ---- Migration: add config_json column if missing ----
+        # Safe to run on every startup.
+        if not _column_exists(connection, "sync_jobs", "config_json"):
+            connection.execute("ALTER TABLE sync_jobs ADD COLUMN config_json TEXT")
+
         connection.commit()
