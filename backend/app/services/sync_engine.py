@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any
 
 from app.db.session import get_connection
 from app.models.last_sync import LastSyncMetadata
 from app.models.sync_job import SyncJob
 
+from typing import Any, Optional
+import psycopg
+from psycopg import sql
+from app.services import postgres_session, postgres_service
 
 def create_sync_job(
     name: str,
