@@ -76,13 +76,16 @@ def _parse_form_list(xml_payload: str) -> list[SurveyCTOForm]:
         title = xform.findtext(".//{*}name")
         version = xform.findtext(".//{*}version")
 
-        if not form_id or not title:
+        if not form_id:
             continue
+
+        # if name is missing, fall back to formID for title
+        resolved_title = (title or form_id).strip()
 
         forms.append(
             SurveyCTOForm(
                 form_id=form_id.strip(),
-                title=title.strip(),
+                title=resolved_title,
                 version=(version or "").strip(),
             )
         )
@@ -107,8 +110,8 @@ def create_session(username: str, password: str, server_url: str) -> SessionInfo
 
 async def _fetch_form_list(session: SessionInfo) -> str:
     """
-    Legacy OpenRosa endpoint. Often accessible, but can return HTML (login page, proxy page, etc.)
-    which would break XML parsing unless we guard it.
+    OpenRosa endpoint /formList.
+    Can return HTML/login pages with 200; we guard against non-XML.
     """
     form_list_url = f"{session.server_url}/formList"
     headers = {
@@ -119,7 +122,7 @@ async def _fetch_form_list(session: SessionInfo) -> str:
 
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(15.0),
+            timeout=httpx.Timeout(20.0),
             follow_redirects=True,
         ) as client:
             response = await client.get(
@@ -143,9 +146,10 @@ async def _fetch_form_list(session: SessionInfo) -> str:
             status_code=response.status_code,
         )
 
-    # Guard against non-XML payloads (e.g., HTML login page) that still return 200
     content_type = (response.headers.get("content-type") or "").lower()
     body = response.text or ""
+
+    # basic non-XML guard
     if ("xml" not in content_type) and (not body.lstrip().startswith("<")):
         raise FormListParseError("SurveyCTO /formList did not return XML.")
 
@@ -155,8 +159,7 @@ async def _fetch_form_list(session: SessionInfo) -> str:
 async def _fetch_form_ids(session: SessionInfo) -> Iterable[str]:
     """
     SurveyCTO Server API v2 endpoint: /api/v2/forms/ids
-
-    Robust against unexpected JSON shapes (prevents AttributeError).
+    Robust against unexpected JSON shapes.
     """
     form_ids_url = f"{session.server_url}/api/v2/forms/ids"
     headers = {
@@ -166,7 +169,7 @@ async def _fetch_form_ids(session: SessionInfo) -> Iterable[str]:
 
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(15.0),
+            timeout=httpx.Timeout(20.0),
             follow_redirects=True,
         ) as client:
             response = await client.get(
@@ -190,7 +193,6 @@ async def _fetch_form_ids(session: SessionInfo) -> Iterable[str]:
             status_code=response.status_code,
         )
 
-    # ---- Robust JSON parsing + shape validation ----
     try:
         payload = response.json()
     except ValueError as exc:
@@ -200,13 +202,11 @@ async def _fetch_form_ids(session: SessionInfo) -> Iterable[str]:
             f"content-type={response.headers.get('content-type')} snippet={snippet!r}"
         ) from exc
 
-    # Expected: {"formIds": [...]}
     if isinstance(payload, dict):
         form_ids = payload.get("formIds")
         if isinstance(form_ids, list):
             return [str(x).strip() for x in form_ids if str(x).strip()]
 
-        # Sometimes APIs return an error object; surface it if present
         if "error" in payload:
             raise ApiAccessError(f"SurveyCTO API error: {payload.get('error')}")
 
@@ -214,7 +214,6 @@ async def _fetch_form_ids(session: SessionInfo) -> Iterable[str]:
             f"SurveyCTO forms ids response missing 'formIds' list. Keys={list(payload.keys())}"
         )
 
-    # Some systems might return a bare list of ids
     if isinstance(payload, list):
         return [str(x).strip() for x in payload if str(x).strip()]
 
@@ -223,31 +222,26 @@ async def _fetch_form_ids(session: SessionInfo) -> Iterable[str]:
 
 async def list_forms(session_token: str) -> list[SurveyCTOForm]:
     """
-    Preferred behavior:
-    1) Use SurveyCTO Server API v2 (/api/v2/forms/ids) first.
-    2) If v2 doesn't exist (404), fall back to OpenRosa /formList (XML).
-    This prevents 500s when /formList returns non-XML content with a 200.
+    Prefer /formList (has titles).
+    Fall back to v2 /api/v2/forms/ids (IDs only).
     """
     session = _SESSIONS.get(session_token)
     if not session:
         raise InvalidSessionError("Session token is invalid or expired.")
 
-    # 1) Prefer v2 (JSON)
+    # 1) Prefer OpenRosa /formList for titles
     try:
-        form_ids = await _fetch_form_ids(session)
-        return [
-            SurveyCTOForm(
-                form_id=form_id,
-                title=form_id,  # API returns only IDs here; use ID as title
-                version="",
-            )
-            for form_id in form_ids
-        ]
-    except ApiAccessError as exc:
-        # Only fall back to /formList if v2 endpoint doesn't exist
-        if exc.status_code != 404:
-            raise
+        xml_payload = await _fetch_form_list(session)
+        forms = _parse_form_list(xml_payload)
+        if forms:
+            return forms
+    except (FormListParseError, ApiAccessError):
+        # fall back to v2 below
+        pass
 
-    # 2) Fallback: /formList (XML)
-    xml_payload = await _fetch_form_list(session)
-    return _parse_form_list(xml_payload)
+    # 2) Fallback to v2 (IDs only)
+    form_ids = await _fetch_form_ids(session)
+    return [
+        SurveyCTOForm(form_id=form_id, title=form_id, version="")
+        for form_id in form_ids
+    ]
