@@ -1,26 +1,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
+from app.services import postgres_service
 
 router = APIRouter(prefix="/api/pg", tags=["postgres"])
 
 
 # -------------------------
-# In-memory "connection"
+# In-memory session (like SurveyCTO)
 # -------------------------
 
 @dataclass
 class _PgSession:
     connected: bool
-    schemas: list[dict]
+    creds: Optional[postgres_service.PostgresCredentials]
 
 
-_PG_SESSION = _PgSession(connected=False, schemas=[])
+_PG_SESSION = _PgSession(connected=False, creds=None)
 
 
 # -------------------------
@@ -47,7 +48,7 @@ class PostgresTable(BaseModel):
     name: str
     columns: list[PostgresColumn]
     primaryKey: Optional[str] = None
-    rowCount: int = 0
+    rowCount: int = 0  # optional; we keep 0 unless you want to count
 
 
 class PostgresSchema(BaseModel):
@@ -97,74 +98,38 @@ class CreateTableResponse(BaseModel):
 # Helpers
 # -------------------------
 
-def _ensure_connected() -> None:
-    if not _PG_SESSION.connected:
+def _ensure_connected() -> postgres_service.PostgresCredentials:
+    if not _PG_SESSION.connected or not _PG_SESSION.creds:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Not connected to database")
+    return _PG_SESSION.creds
 
 
-def _mock_schemas() -> list[PostgresSchema]:
+def _map_surveycto_type_to_pg(field_type: str) -> str:
     """
-    Temporary mocked structure until you add a real Postgres driver.
+    Basic mapping. SurveyCTO field.type values can vary depending on where you source them from.
+    You can refine later.
     """
-    return [
-        PostgresSchema(
-            name="public",
-            tables=[
-                PostgresTable(
-                    name="responses",
-                    primaryKey="id",
-                    rowCount=0,
-                    columns=[
-                        PostgresColumn(name="id", type="TEXT", nullable=False, isPrimaryKey=True),
-                        PostgresColumn(name="created_at", type="TIMESTAMPTZ", nullable=True),
-                    ],
-                ),
-                PostgresTable(
-                    name="incoming_responses",
-                    primaryKey=None,
-                    rowCount=0,
-                    columns=[
-                        PostgresColumn(name="raw_json", type="JSONB", nullable=True),
-                    ],
-                ),
-            ],
-        ),
-        PostgresSchema(
-            name="staging",
-            tables=[
-                PostgresTable(
-                    name="staging_table",
-                    primaryKey=None,
-                    rowCount=0,
-                    columns=[
-                        PostgresColumn(name="id", type="TEXT", nullable=True),
-                    ],
-                ),
-            ],
-        ),
-    ]
-
-
-def _find_table(schema_name: str, table_name: str) -> Optional[PostgresTable]:
-    for s in _PG_SESSION.schemas:
-        if s["name"] == schema_name:
-            for t in s["tables"]:
-                if t["name"] == table_name:
-                    return PostgresTable(**t)
-    return None
+    t = (field_type or "").strip().lower()
+    if t in {"integer", "int"}:
+        return "INTEGER"
+    if t in {"decimal", "double", "float", "numeric"}:
+        return "NUMERIC"
+    if t in {"date"}:
+        return "DATE"
+    if t in {"datetime", "timestamp"}:
+        return "TIMESTAMPTZ"
+    if t in {"boolean", "bool"}:
+        return "BOOLEAN"
+    # default
+    return "TEXT"
 
 
 # -------------------------
-# Routes expected by frontend
+# Routes
 # -------------------------
 
 @router.post("/connect", response_model=PostgresConnectionResponse)
 def connect(credentials: PostgresCredentials) -> PostgresConnectionResponse:
-    """
-    POST /api/pg/connect
-    For now: mocked 'success'. Later: replace with real connection test.
-    """
-    # Basic input validation (frontend also validates, but keep backend safe)
     if not credentials.host.strip():
         return PostgresConnectionResponse(success=False, error="Host is required")
     if not credentials.database.strip():
@@ -174,75 +139,164 @@ def connect(credentials: PostgresCredentials) -> PostgresConnectionResponse:
     if not credentials.password.strip():
         return PostgresConnectionResponse(success=False, error="Password is required")
 
-    schemas = _mock_schemas()
+    creds = postgres_service.PostgresCredentials(
+        host=credentials.host.strip(),
+        port=int(credentials.port),
+        database=credentials.database.strip(),
+        username=credentials.username.strip(),
+        password=credentials.password,
+        sslmode=credentials.sslMode,
+    )
 
-    # Store "connected" session in memory
+    try:
+        postgres_service.test_connection(creds)
+    except postgres_service.PostgresConnectionError as exc:
+        return PostgresConnectionResponse(success=False, error=str(exc))
+
+    # store in memory
     _PG_SESSION.connected = True
-    _PG_SESSION.schemas = [s.model_dump() for s in schemas]
+    _PG_SESSION.creds = creds
+
+    # return schemas + tables (lightweight: columns omitted by default? but frontend expects columns)
+    schemas = []
+    try:
+        schema_names = postgres_service.list_schemas(creds)
+        for s in schema_names:
+            table_names = postgres_service.list_tables(creds, s)
+            tables: list[PostgresTable] = []
+            for t in table_names:
+                cols = postgres_service.get_table_columns(creds, s, t)
+                pk = next((c.name for c in cols if c.is_primary_key), None)
+                tables.append(
+                    PostgresTable(
+                        name=t,
+                        primaryKey=pk,
+                        rowCount=0,
+                        columns=[
+                            PostgresColumn(
+                                name=c.name,
+                                type=c.type,
+                                nullable=c.nullable,
+                                isPrimaryKey=c.is_primary_key,
+                            )
+                            for c in cols
+                        ],
+                    )
+                )
+            schemas.append(PostgresSchema(name=s, tables=tables))
+    except Exception as exc:
+        return PostgresConnectionResponse(success=False, error=f"Connected, but failed to load schemas: {exc}")
 
     return PostgresConnectionResponse(success=True, schemas=schemas)
 
 
 @router.get("/schemas", response_model=list[PostgresSchema])
 def list_schemas() -> list[PostgresSchema]:
-    """
-    GET /api/pg/schemas
-    """
-    _ensure_connected()
-    return [PostgresSchema(**s) for s in _PG_SESSION.schemas]
+    creds = _ensure_connected()
+
+    schema_names = postgres_service.list_schemas(creds)
+    result: list[PostgresSchema] = []
+
+    for s in schema_names:
+        table_names = postgres_service.list_tables(creds, s)
+        tables: list[PostgresTable] = []
+        for t in table_names:
+            cols = postgres_service.get_table_columns(creds, s, t)
+            pk = next((c.name for c in cols if c.is_primary_key), None)
+            tables.append(
+                PostgresTable(
+                    name=t,
+                    primaryKey=pk,
+                    rowCount=0,
+                    columns=[
+                        PostgresColumn(
+                            name=c.name,
+                            type=c.type,
+                            nullable=c.nullable,
+                            isPrimaryKey=c.is_primary_key,
+                        )
+                        for c in cols
+                    ],
+                )
+            )
+        result.append(PostgresSchema(name=s, tables=tables))
+
+    return result
 
 
 @router.get("/schemas/{schema_name}/tables", response_model=list[PostgresTable])
 def list_tables(schema_name: str) -> list[PostgresTable]:
-    """
-    GET /api/pg/schemas/:schemaName/tables
-    """
-    _ensure_connected()
+    creds = _ensure_connected()
 
-    for s in _PG_SESSION.schemas:
-        if s["name"] == schema_name:
-            return [PostgresTable(**t) for t in s["tables"]]
-
-    # Return empty list if schema doesn't exist (frontend handles it)
-    return []
+    table_names = postgres_service.list_tables(creds, schema_name)
+    tables: list[PostgresTable] = []
+    for t in table_names:
+        cols = postgres_service.get_table_columns(creds, schema_name, t)
+        pk = next((c.name for c in cols if c.is_primary_key), None)
+        tables.append(
+            PostgresTable(
+                name=t,
+                primaryKey=pk,
+                rowCount=0,
+                columns=[
+                    PostgresColumn(
+                        name=c.name,
+                        type=c.type,
+                        nullable=c.nullable,
+                        isPrimaryKey=c.is_primary_key,
+                    )
+                    for c in cols
+                ],
+            )
+        )
+    return tables
 
 
 @router.post("/validate-schema", response_model=SchemaCompatibility)
 def validate_schema(payload: ValidateSchemaRequest) -> SchemaCompatibility:
-    """
-    POST /api/pg/validate-schema
-    Checks compatibility between SurveyCTO fields and target table.
-    (Mocked logic based on in-memory schema.)
-    """
-    _ensure_connected()
+    creds = _ensure_connected()
 
-    table = _find_table(payload.targetSchema, payload.targetTable)
-    if not table:
-        # If table doesn't exist, the schema is "compatible" only if user will create a new one
-        return SchemaCompatibility(
-            compatible=False,
-            missingColumns=[f.name for f in payload.formFields],
-            extraColumns=[],
-            typeMismatches=[],
-            primaryKeyMatch=False,
-        )
+    # If table doesn't exist, return "missing all"
+    try:
+        table_names = postgres_service.list_tables(creds, payload.targetSchema)
+        if payload.targetTable not in table_names:
+            return SchemaCompatibility(
+                compatible=False,
+                missingColumns=[f.name for f in payload.formFields],
+                extraColumns=[],
+                typeMismatches=[],
+                primaryKeyMatch=False,
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to validate schema: {exc}") from exc
 
-    form_field_names = {f.name for f in payload.formFields}
-    table_col_names = {c.name for c in table.columns}
+    cols = postgres_service.get_table_columns(creds, payload.targetSchema, payload.targetTable)
+    table_col_map: Dict[str, postgres_service.ColumnInfo] = {c.name: c for c in cols}
 
-    missing = sorted(list(form_field_names - table_col_names))
-    extra = sorted(list(table_col_names - form_field_names))
+    form_names = {f.name for f in payload.formFields}
+    table_names_set = set(table_col_map.keys())
 
-    # type mismatch check (very basic / placeholder)
+    missing = sorted(list(form_names - table_names_set))
+    extra = sorted(list(table_names_set - form_names))
+
     type_mismatches: list[dict] = []
-    col_type_map: Dict[str, str] = {c.name: c.type for c in table.columns}
     for f in payload.formFields:
-        if f.name in col_type_map:
-            # we can't reliably map without a shared type system yet
-            pass
+        if f.name in table_col_map:
+            expected = _map_surveycto_type_to_pg(f.type)
+            actual = table_col_map[f.name].type
+            # very tolerant: only flag if clearly different
+            if expected != actual and not (expected == "NUMERIC" and actual in {"INTEGER", "BIGINT", "NUMERIC"}):
+                type_mismatches.append(
+                    {
+                        "field": f.name,
+                        "expected": expected,
+                        "actual": actual,
+                    }
+                )
 
     form_pk = next((f.name for f in payload.formFields if f.isPrimaryKey), None)
-    pk_match = (form_pk is not None) and (table.primaryKey == form_pk)
+    table_pk = next((c.name for c in cols if c.is_primary_key), None)
+    pk_match = (form_pk is not None) and (table_pk == form_pk)
 
     compatible = (len(missing) == 0) and (len(type_mismatches) == 0)
 
@@ -257,42 +311,27 @@ def validate_schema(payload: ValidateSchemaRequest) -> SchemaCompatibility:
 
 @router.post("/tables", response_model=CreateTableResponse)
 def create_table(payload: CreateTableRequest) -> CreateTableResponse:
-    """
-    POST /api/pg/tables
-    Mock: "creates" a table by adding it to in-memory schemas.
-    """
-    _ensure_connected()
+    creds = _ensure_connected()
 
     if not payload.schemaName.strip():
         return CreateTableResponse(success=False, error="schemaName is required")
     if not payload.tableName.strip():
         return CreateTableResponse(success=False, error="tableName is required")
 
-    # Ensure schema exists in our mock store
-    schema = None
-    for s in _PG_SESSION.schemas:
-        if s["name"] == payload.schemaName:
-            schema = s
-            break
-
-    if schema is None:
-        schema = {"name": payload.schemaName, "tables": []}
-        _PG_SESSION.schemas.append(schema)
-
-    # Prevent duplicates
-    for t in schema["tables"]:
-        if t["name"] == payload.tableName:
-            return CreateTableResponse(success=False, error="Table already exists")
-
+    # Find primary key if any
     pk = next((c.name for c in payload.columns if c.isPrimaryKey), None)
 
-    schema["tables"].append(
-        {
-            "name": payload.tableName,
-            "columns": [c.model_dump() for c in payload.columns],
-            "primaryKey": pk,
-            "rowCount": 0,
-        }
-    )
+    try:
+        postgres_service.create_table(
+            creds=creds,
+            schema=payload.schemaName,
+            table=payload.tableName,
+            columns=[c.model_dump() for c in payload.columns],
+            primary_key=pk,
+        )
+    except postgres_service.PostgresServiceError as exc:
+        return CreateTableResponse(success=False, error=str(exc))
+    except Exception as exc:
+        return CreateTableResponse(success=False, error=f"Failed to create table: {exc}")
 
     return CreateTableResponse(success=True)
