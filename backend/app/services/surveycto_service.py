@@ -245,3 +245,42 @@ async def list_forms(session_token: str) -> list[SurveyCTOForm]:
         SurveyCTOForm(form_id=form_id, title=form_id, version="")
         for form_id in form_ids
     ]
+
+
+
+
+async def download_form_wide_json(session_token: str, form_id: str, date: str = "0") -> list[dict]:
+    """
+    Uses SurveyCTO v2 endpoint:
+      /api/v2/forms/data/wide/json/{formId}?date=...
+    Returns a list of submission dicts.
+    """
+    session = _SESSIONS.get(session_token)
+    if not session:
+        raise InvalidSessionError("Session token is invalid or expired.")
+
+    url = f"{session.server_url}/api/v2/forms/data/wide/json/{form_id}"
+    headers = {"Accept": "application/json", "User-Agent": "SurveySync Connect"}
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0), follow_redirects=True) as client:
+            resp = await client.get(url, params={"date": date}, auth=(session.username, session.password), headers=headers)
+    except httpx.RequestError as exc:
+        raise ServerConnectionError("Unable to reach the SurveyCTO server.") from exc
+
+    if resp.status_code in {401, 403}:
+        raise AuthenticationError("SurveyCTO credentials are invalid or access is denied.")
+    if resp.status_code == 404:
+        raise ApiAccessError("SurveyCTO form data endpoint not found.", status_code=404)
+    if resp.status_code >= 400:
+        raise ApiAccessError(f"SurveyCTO data download failed with status {resp.status_code}.", status_code=resp.status_code)
+
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        raise FormListParseError("SurveyCTO data returned invalid JSON.") from exc
+
+    if not isinstance(payload, list):
+        raise FormListParseError("SurveyCTO wide JSON response is not a list.")
+    return payload
+
