@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 import psycopg
 from psycopg import sql
@@ -27,6 +27,14 @@ class PostgresCredentials:
     username: str
     password: str
     sslmode: str = "disable"  # disable | prefer | require
+
+
+@dataclass
+class ColumnInfo:
+    name: str
+    type: str
+    nullable: bool
+    is_primary_key: bool = False
 
 
 def _connect(creds: PostgresCredentials) -> psycopg.Connection:
@@ -91,24 +99,15 @@ def list_tables(creds: PostgresCredentials, schema: str) -> list[str]:
         conn.close()
 
 
-@dataclass
-class ColumnInfo:
-    name: str
-    type: str
-    nullable: bool
-    is_primary_key: bool
-
-
 def get_table_columns(creds: PostgresCredentials, schema: str, table: str) -> list[ColumnInfo]:
     conn = _connect(creds)
     try:
         with conn.cursor() as cur:
-            # columns
             cur.execute(
                 """
                 SELECT
                     c.column_name,
-                    c.data_type,
+                    c.udt_name,
                     (c.is_nullable = 'YES') AS is_nullable
                 FROM information_schema.columns c
                 WHERE c.table_schema = %s
@@ -119,7 +118,6 @@ def get_table_columns(creds: PostgresCredentials, schema: str, table: str) -> li
             )
             cols = cur.fetchall()
 
-            # primary key cols
             cur.execute(
                 """
                 SELECT kcu.column_name
@@ -138,11 +136,11 @@ def get_table_columns(creds: PostgresCredentials, schema: str, table: str) -> li
             return [
                 ColumnInfo(
                     name=name,
-                    type=data_type,
-                    nullable=is_nullable,
+                    type=_normalize_pg_type(udt_name),
+                    nullable=bool(is_nullable),
                     is_primary_key=(name in pk_cols),
                 )
-                for (name, data_type, is_nullable) in cols
+                for (name, udt_name, is_nullable) in cols
             ]
     finally:
         conn.close()
@@ -166,57 +164,40 @@ def create_table(
     primary_key: Optional[str] = None,
 ) -> None:
     """
-    columns: list of {name, type, nullable, isPrimaryKey}
-    primary_key: optional pk column name
+    Create table safely with quoted identifiers.
+    columns elements: {name, type, nullable, isPrimaryKey}
     """
     ensure_schema(creds, schema)
 
-    # Build columns DDL
-    col_sql: list[sql.SQL] = []
-    pk_col: Optional[str] = primary_key
+    col_defs: list[sql.SQL] = []
+    pk_col = primary_key
 
     for c in columns:
-        col_name = c["name"]
-        col_type = c["type"]
+        col_name = str(c["name"])
+        col_type = str(c.get("type") or "TEXT")
         nullable = bool(c.get("nullable", True))
         is_pk = bool(c.get("isPrimaryKey", False))
 
         if is_pk and not pk_col:
             pk_col = col_name
 
-        # WARNING: type is injected as SQL; restrict to known types or map from UI
-        # For now, we allow common types.
-        # In production, you should map SurveyCTO types -> safe postgres types.
-        allowed = {
-            "TEXT",
-            "INTEGER",
-            "BIGINT",
-            "DOUBLE PRECISION",
-            "NUMERIC",
-            "BOOLEAN",
-            "DATE",
-            "TIMESTAMP",
-            "TIMESTAMPTZ",
-            "JSONB",
-        }
-        normalized_type = col_type.strip().upper()
-        if normalized_type not in allowed:
-            normalized_type = "TEXT"
+        pg_type = _coerce_allowed_type(col_type)
 
-        col_def = sql.SQL("{} {} {}").format(
-            sql.Identifier(col_name),
-            sql.SQL(normalized_type),
-            sql.SQL("NULL" if nullable else "NOT NULL"),
+        col_defs.append(
+            sql.SQL("{} {} {}").format(
+                sql.Identifier(col_name),
+                sql.SQL(pg_type),
+                sql.SQL("NULL" if nullable else "NOT NULL"),
+            )
         )
-        col_sql.append(col_def)
 
     if pk_col:
-        col_sql.append(sql.SQL("PRIMARY KEY ({})").format(sql.Identifier(pk_col)))
+        col_defs.append(sql.SQL("PRIMARY KEY ({})").format(sql.Identifier(pk_col)))
 
     stmt = sql.SQL("CREATE TABLE IF NOT EXISTS {}.{} ({})").format(
         sql.Identifier(schema),
         sql.Identifier(table),
-        sql.SQL(", ").join(col_sql),
+        sql.SQL(", ").join(col_defs),
     )
 
     conn = _connect(creds)
@@ -226,3 +207,60 @@ def create_table(
         conn.commit()
     finally:
         conn.close()
+
+
+# -----------------------
+# Type helpers
+# -----------------------
+
+_ALLOWED_TYPES = {
+    "TEXT",
+    "INTEGER",
+    "BIGINT",
+    "DOUBLE PRECISION",
+    "NUMERIC",
+    "BOOLEAN",
+    "DATE",
+    "TIMESTAMP",
+    "TIMESTAMPTZ",
+    "JSONB",
+}
+
+
+def _coerce_allowed_type(t: str) -> str:
+    """
+    Prevent SQL injection via types: only allow known safe types.
+    Unknown types => TEXT.
+    """
+    normalized = t.strip().upper()
+    if normalized == "TIMESTAMP WITH TIME ZONE":
+        normalized = "TIMESTAMPTZ"
+    if normalized == "TIMESTAMP WITHOUT TIME ZONE":
+        normalized = "TIMESTAMP"
+    if normalized not in _ALLOWED_TYPES:
+        return "TEXT"
+    return normalized
+
+
+def _normalize_pg_type(udt_name: str) -> str:
+    """
+    Convert postgres UDT names to friendly types the UI uses.
+    """
+    m = {
+        "text": "TEXT",
+        "varchar": "TEXT",
+        "bpchar": "TEXT",
+        "int2": "INTEGER",
+        "int4": "INTEGER",
+        "int8": "BIGINT",
+        "float4": "DOUBLE PRECISION",
+        "float8": "DOUBLE PRECISION",
+        "numeric": "NUMERIC",
+        "bool": "BOOLEAN",
+        "date": "DATE",
+        "timestamp": "TIMESTAMP",
+        "timestamptz": "TIMESTAMPTZ",
+        "json": "JSONB",
+        "jsonb": "JSONB",
+    }
+    return m.get((udt_name or "").lower(), "TEXT")
