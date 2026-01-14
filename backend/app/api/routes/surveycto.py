@@ -41,7 +41,7 @@ async def list_forms(
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 
     except Exception as exc:
-        # Optional: add logging here
+        # Prevents undocumented 500s and makes debugging much easier
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Unexpected error while listing forms: {type(exc).__name__}",
