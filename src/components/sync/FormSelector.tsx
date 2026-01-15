@@ -34,13 +34,15 @@ const FormSelector = ({ onSelect }: FormSelectorProps) => {
     }
   };
 
-  const formatDate = (dateString: string) => {
-    try {
-      return formatDistanceToNow(new Date(dateString), { addSuffix: true });
-    } catch {
-      return dateString;
-    }
-  };
+const formatDate = (dateString?: string) => {
+  if (!dateString) return "Unknown";
+  try {
+    return formatDistanceToNow(new Date(dateString), { addSuffix: true });
+  } catch {
+    return dateString;
+  }
+};
+
 
   return (
     <Card className="w-full max-w-2xl mx-auto shadow-card border-border/50 animate-fade-in">
