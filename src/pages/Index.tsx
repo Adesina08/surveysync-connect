@@ -58,8 +58,7 @@ const IndexContent = () => {
               <span className="text-gradient block mt-1">Effortlessly</span>
             </h1>
             <p className="text-lg text-muted-foreground max-w-xl mx-auto">
-              Connect your SurveyCTO forms directly to PostgreSQL. 
-              No coding required — just point, click, and sync.
+              Connect your SurveyCTO forms directly to PostgreSQL. Just click and sync.
             </p>
           </div>
         )}
