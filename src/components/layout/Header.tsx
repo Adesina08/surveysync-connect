@@ -13,15 +13,6 @@ const Header = () => {
             <p className="text-xs text-muted-foreground -mt-0.5">SurveyCTO → PostgreSQL</p>
           </div>
         </div>
-        
-        <nav className="flex items-center gap-6">
-          <span className="text-sm text-muted-foreground hover:text-foreground transition-colors cursor-pointer">
-            Documentation
-          </span>
-          <span className="text-sm text-muted-foreground hover:text-foreground transition-colors cursor-pointer">
-            Support
-          </span>
-        </nav>
       </div>
     </header>
   );
