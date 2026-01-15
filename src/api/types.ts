@@ -10,10 +10,13 @@ export interface SurveyCTOForm {
   id: string;
   name: string;
   version: string;
-  responses: number;
-  lastUpdated: string;
-  fields: SurveyCTOField[];
+
+  // Optional metadata (backend may not provide yet)
+  responses?: number;
+  lastUpdated?: string;
+  fields?: SurveyCTOField[];
 }
+
 
 export interface SurveyCTOField {
   name: string;
@@ -75,23 +78,23 @@ export interface SyncJobConfig {
   formId: string;
   targetSchema: string;
   targetTable: string;
-  syncMode: 'insert' | 'upsert';
-  primaryKeyField: string;
+  syncMode: 'insert' | 'upsert' | 'replace';
+  primaryKeyField?: string;
   createNewTable: boolean;
 }
 
 export interface SyncProgress {
-  jobId: string;
-  status: 'pending' | 'running' | 'completed' | 'failed';
-  totalRecords: number;
+  jobId: number;
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
   processedRecords: number;
+  totalRecords: number;
   insertedRecords: number;
   updatedRecords: number;
-  skippedRecords: number;
   errors: SyncError[];
-  startedAt: string;
+  startedAt?: string;
   completedAt?: string;
 }
+
 
 export interface SyncError {
   recordId: string;
