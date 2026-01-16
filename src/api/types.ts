@@ -81,6 +81,7 @@ export interface SyncJobConfig {
   syncMode: 'insert' | 'upsert' | 'replace';
   primaryKeyField?: string;
   createNewTable: boolean;
+  sessionToken?: string;
 }
 
 export interface SyncProgress {

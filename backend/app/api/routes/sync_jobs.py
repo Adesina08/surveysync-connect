@@ -7,7 +7,7 @@ from typing import Any, Dict, Literal, Optional
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
-from app.services import sync_engine
+from app.services import postgres_service, postgres_session, surveycto_service, sync_engine
 
 router = APIRouter(prefix="/api/sync-jobs", tags=["sync-jobs"])
 
@@ -40,6 +40,7 @@ class SyncJobCreateRequest(BaseModel):
     syncMode: Literal["insert", "upsert", "replace"] = "upsert"
     primaryKeyField: str | None = None
     createNewTable: bool = False
+    sessionToken: str | None = None
 
 
 # -------------------------
@@ -59,39 +60,94 @@ def _build_name(form_id: str, schema: str, table: str) -> str:
     return name[:200]
 
 
-async def _run_fake_sync(job_id: int) -> None:
-    """
-    Option B: simulated sync.
-    This makes the UI work end-to-end (progress polling) while you build real SurveyCTO->Postgres transfer.
-    """
+def _utc_to_epoch_seconds(value: datetime | None) -> str:
+    if value is None:
+        return "0"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return str(int(value.astimezone(timezone.utc).timestamp()))
+
+
+def _build_row_payload(row: dict, columns: list[str]) -> dict:
+    return {col: row.get(col) for col in columns}
+
+
+async def _run_sync(job_id: int, payload: SyncJobCreateRequest) -> None:
     progress = _PROGRESS[job_id]
     progress.status = "running"
     progress.startedAt = _utc_now_iso()
-
-    # Simulate totals
-    progress.totalRecords = 250
-
     try:
-        for i in range(1, progress.totalRecords + 1):
-            # Cancellation check
-            if progress.status == "cancelled":
-                progress.completedAt = _utc_now_iso()
-                return
+        if not payload.sessionToken:
+            raise ValueError("SurveyCTO session token is required.")
 
-            # Simulate work
-            await asyncio.sleep(0.01)
+        try:
+            creds = postgres_session.get_credentials()
+        except RuntimeError as exc:
+            raise ValueError(str(exc)) from exc
 
-            progress.processedRecords = i
+        source = f"surveycto:{payload.formId}"
+        target = f"postgres:{payload.targetSchema}.{payload.targetTable}"
+        last_sync = sync_engine.get_last_sync(source, target)
+        date_param = _utc_to_epoch_seconds(last_sync.last_synced_at if last_sync else None)
 
-            # Simulate inserts/updates split
-            if i % 3 == 0:
-                progress.updatedRecords += 1
-            else:
-                progress.insertedRecords += 1
+        submissions = await surveycto_service.download_form_wide_json(
+            payload.sessionToken,
+            payload.formId,
+            date=date_param,
+        )
+
+        progress.totalRecords = len(submissions)
+
+        if progress.totalRecords == 0:
+            progress.status = "completed"
+            progress.completedAt = _utc_now_iso()
+            sync_engine.record_sync_completion(job_id, status="completed", last_error=None)
+            sync_engine.upsert_last_sync(source, target, datetime.now(tz=timezone.utc))
+            return
+
+        if payload.createNewTable:
+            raise ValueError("Automatic table creation is not implemented. Create the table first.")
+
+        cols = postgres_service.get_table_columns(creds, payload.targetSchema, payload.targetTable)
+        column_names = [c.name for c in cols]
+
+        if not column_names:
+            raise ValueError("Target table has no columns.")
+
+        primary_key = payload.primaryKeyField or next((c.name for c in cols if c.is_primary_key), None)
+
+        rows = [_build_row_payload(row, column_names) for row in submissions]
+
+        if payload.syncMode == "replace":
+            postgres_service.delete_all_rows(creds, payload.targetSchema, payload.targetTable)
+            inserted = postgres_service.insert_rows(creds, payload.targetSchema, payload.targetTable, column_names, rows)
+            progress.insertedRecords = inserted
+            progress.updatedRecords = 0
+            progress.processedRecords = progress.totalRecords
+        elif payload.syncMode == "insert":
+            inserted = postgres_service.insert_rows(creds, payload.targetSchema, payload.targetTable, column_names, rows)
+            progress.insertedRecords = inserted
+            progress.updatedRecords = 0
+            progress.processedRecords = progress.totalRecords
+        else:
+            if not primary_key:
+                raise ValueError("Primary key field is required for upsert mode.")
+            inserted, updated = postgres_service.upsert_rows(
+                creds,
+                payload.targetSchema,
+                payload.targetTable,
+                column_names,
+                rows,
+                primary_key,
+            )
+            progress.insertedRecords = inserted
+            progress.updatedRecords = updated
+            progress.processedRecords = progress.totalRecords
 
         progress.status = "completed"
         progress.completedAt = _utc_now_iso()
         sync_engine.record_sync_completion(job_id, status="completed", last_error=None)
+        sync_engine.upsert_last_sync(source, target, datetime.now(tz=timezone.utc))
 
     except Exception as exc:
         progress.status = "failed"
@@ -136,7 +192,7 @@ async def create_sync_job(payload: SyncJobCreateRequest) -> SyncProgressResponse
     )
 
     _PROGRESS[job.id] = progress
-    _TASKS[job.id] = asyncio.create_task(_run_fake_sync(job.id))
+    _TASKS[job.id] = asyncio.create_task(_run_sync(job.id, payload))
 
     return progress
 
