@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import psycopg2
-from psycopg2 import sql
+from psycopg2 import extras, sql
 
 from app.services import postgres_service, surveycto_service, sync_engine
 
@@ -75,9 +75,6 @@ def run_sync_job(job_id: int, session_token: str) -> dict[str, Any]:
     since_dt = last_sync.last_synced_at if last_sync else None
 
     # 1) Fetch SurveyCTO submissions
-    rows = psycopg2.extras.wait_select  # just to ensure extras import doesn't confuse lint
-    rows = []
-
     # mark running
     sync_engine.record_sync_completion(job_id, "running", None)
 
@@ -222,7 +219,7 @@ def _insert_append(cur, schema: str, table: str, rows: list[dict[str, Any]], col
         tuple(_to_db_value(r.get(c)) for c in cols)
         for r in rows
     ]
-    psycopg2.extras.execute_batch(cur, q, values, page_size=500)
+    extras.execute_batch(cur, q, values, page_size=500)
     return len(values)
 
 
@@ -249,5 +246,5 @@ def _upsert(cur, schema: str, table: str, rows: list[dict[str, Any]], cols: list
         tuple(_to_db_value(r.get(c)) for c in insert_cols)
         for r in rows
     ]
-    psycopg2.extras.execute_batch(cur, q, values, page_size=500)
+    extras.execute_batch(cur, q, values, page_size=500)
     return len(values)
