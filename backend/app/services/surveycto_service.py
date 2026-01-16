@@ -79,7 +79,6 @@ def _parse_form_list(xml_payload: str) -> list[SurveyCTOForm]:
         if not form_id:
             continue
 
-        # if name is missing, fall back to formID for title
         resolved_title = (title or form_id).strip()
 
         forms.append(
@@ -121,10 +120,7 @@ async def _fetch_form_list(session: SessionInfo) -> str:
     }
 
     try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(20.0),
-            follow_redirects=True,
-        ) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0), follow_redirects=True) as client:
             response = await client.get(
                 form_list_url,
                 auth=(session.username, session.password),
@@ -159,7 +155,6 @@ async def _fetch_form_list(session: SessionInfo) -> str:
 async def _fetch_form_ids(session: SessionInfo) -> Iterable[str]:
     """
     SurveyCTO Server API v2 endpoint: /api/v2/forms/ids
-    Robust against unexpected JSON shapes.
     """
     form_ids_url = f"{session.server_url}/api/v2/forms/ids"
     headers = {
@@ -168,10 +163,7 @@ async def _fetch_form_ids(session: SessionInfo) -> Iterable[str]:
     }
 
     try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(20.0),
-            follow_redirects=True,
-        ) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0), follow_redirects=True) as client:
             response = await client.get(
                 form_ids_url,
                 auth=(session.username, session.password),
@@ -196,28 +188,13 @@ async def _fetch_form_ids(session: SessionInfo) -> Iterable[str]:
     try:
         payload = response.json()
     except ValueError as exc:
-        snippet = (response.text or "")[:300]
-        raise FormListParseError(
-            "SurveyCTO forms ids returned invalid JSON. "
-            f"content-type={response.headers.get('content-type')} snippet={snippet!r}"
-        ) from exc
+        raise FormListParseError("Unable to parse SurveyCTO form ids response (invalid JSON).") from exc
 
-    if isinstance(payload, dict):
-        form_ids = payload.get("formIds")
-        if isinstance(form_ids, list):
-            return [str(x).strip() for x in form_ids if str(x).strip()]
+    form_ids = payload.get("formIds") if isinstance(payload, dict) else None
+    if not isinstance(form_ids, list):
+        raise FormListParseError("Unable to parse SurveyCTO form ids response.")
 
-        if "error" in payload:
-            raise ApiAccessError(f"SurveyCTO API error: {payload.get('error')}")
-
-        raise FormListParseError(
-            f"SurveyCTO forms ids response missing 'formIds' list. Keys={list(payload.keys())}"
-        )
-
-    if isinstance(payload, list):
-        return [str(x).strip() for x in payload if str(x).strip()]
-
-    raise FormListParseError(f"Unexpected JSON type from forms ids: {type(payload).__name__}")
+    return [str(form_id).strip() for form_id in form_ids if str(form_id).strip()]
 
 
 async def list_forms(session_token: str) -> list[SurveyCTOForm]:
@@ -236,74 +213,48 @@ async def list_forms(session_token: str) -> list[SurveyCTOForm]:
         if forms:
             return forms
     except (FormListParseError, ApiAccessError):
-        # fall back to v2 below
         pass
 
     # 2) Fallback to v2 (IDs only)
     form_ids = await _fetch_form_ids(session)
-    return [
-        SurveyCTOForm(form_id=form_id, title=form_id, version="")
-        for form_id in form_ids
-    ]
-
-
-
-
-async def download_form_wide_json(session_token: str, form_id: str, date: str = "0") -> list[dict]:
-    """
-    Uses SurveyCTO v2 endpoint:
-      /api/v2/forms/data/wide/json/{formId}?date=...
-    Returns a list of submission dicts.
-    """
-    session = _SESSIONS.get(session_token)
-    if not session:
-        raise InvalidSessionError("Session token is invalid or expired.")
-
-    url = f"{session.server_url}/api/v2/forms/data/wide/json/{form_id}"
-    headers = {"Accept": "application/json", "User-Agent": "SurveySync Connect"}
-
-    params = {"date": date} if date and date != "0" else {}
-
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0), follow_redirects=True) as client:
-            resp = await client.get(
-                url,
-                params=params,
-                auth=(session.username, session.password),
-                headers=headers,
-            )
-            if resp.status_code == 412 and params:
-                resp = await client.get(
-                    url,
-                    auth=(session.username, session.password),
-                    headers=headers,
-                )
-    except httpx.RequestError as exc:
-        raise ServerConnectionError("Unable to reach the SurveyCTO server.") from exc
-
-    if resp.status_code in {401, 403}:
-        raise AuthenticationError("SurveyCTO credentials are invalid or access is denied.")
-    if resp.status_code == 404:
-        raise ApiAccessError("SurveyCTO form data endpoint not found.", status_code=404)
-    if resp.status_code >= 400:
-        raise ApiAccessError(f"SurveyCTO data download failed with status {resp.status_code}.", status_code=resp.status_code)
-
-    try:
-        payload = resp.json()
-    except ValueError as exc:
-        raise FormListParseError("SurveyCTO data returned invalid JSON.") from exc
-
-    if not isinstance(payload, list):
-        raise FormListParseError("SurveyCTO wide JSON response is not a list.")
-    return payload
+    return [SurveyCTOForm(form_id=form_id, title=form_id, version="") for form_id in form_ids]
 
 
 def _datetime_to_epoch_seconds(dt: datetime | None) -> int:
+    """
+    Convert datetime to Unix epoch seconds (UTC) for SurveyCTO date parameter.
+    If dt is None => full pull => date=0 (subject to SurveyCTO quiet-period rules).
+    """
     if dt is None:
         return 0
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.astimezone(timezone.utc).timestamp())
+    dt_utc = dt.astimezone(timezone.utc)
+    return int(dt_utc.timestamp())
+
+
+def _extract_surveycto_error_message(resp: httpx.Response) -> str | None:
+    """
+    Best-effort: SurveyCTO errors sometimes come as JSON:
+      { "error": { "code": ..., "message": "...", ... } }
+    """
+    try:
+        payload = resp.json()
+    except Exception:
+        return None
+
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message")
+            if isinstance(msg, str) and msg.strip():
+                return msg.strip()
+        # sometimes: {"detail": "..."} etc
+        for k in ("message", "detail"):
+            v = payload.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return None
 
 
 async def fetch_wide_json_submissions(
@@ -311,29 +262,70 @@ async def fetch_wide_json_submissions(
     form_id: str,
     since_dt: datetime | None,
 ) -> list[dict[str, Any]]:
+    """
+    Fetch submissions from:
+      /api/v2/forms/data/wide/json/{form_id}?date={epoch_seconds}
+
+    Handles SurveyCTO's "quiet period" / precondition behavior (commonly 412/417)
+    and rate limiting (429) with clear error messages.
+    """
     session = _SESSIONS.get(session_token)
     if not session:
         raise InvalidSessionError("Session token is invalid or expired.")
 
     date_param = _datetime_to_epoch_seconds(since_dt)
-    url = f"{session.server_url}/api/v2/forms/data/wide/json/{form_id}?date={date_param}"
+    url = f"{session.server_url}/api/v2/forms/data/wide/json/{form_id}"
+    params = {"date": str(date_param)}
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "SurveySync Connect",
+    }
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(60.0), follow_redirects=True) as client:
-            resp = await client.get(url, auth=(session.username, session.password))
+            resp = await client.get(
+                url,
+                params=params,
+                headers=headers,
+                auth=(session.username, session.password),
+            )
     except httpx.RequestError as exc:
         raise ServerConnectionError("Unable to reach the SurveyCTO server.") from exc
-
-    # SurveyCTO “quiet period” / precondition behavior for full pulls
-    if resp.status_code == 417:
-        return []
 
     if resp.status_code in {401, 403}:
         raise AuthenticationError("SurveyCTO credentials are invalid or access is denied.")
 
-    if resp.status_code >= 400:
+    # SurveyCTO full-pull quiet period / precondition behavior
+    # (your earlier script handled 417; in practice some servers return 412 too)
+    if resp.status_code in {412, 417}:
+        msg = _extract_surveycto_error_message(resp)
+        extra = ""
+        if date_param == 0:
+            extra = (
+                " SurveyCTO may enforce a quiet period for full pulls (date=0). "
+                "Wait a few minutes and try again."
+            )
         raise ApiAccessError(
-            f"SurveyCTO submissions request failed with status {resp.status_code}.",
+            f"SurveyCTO temporarily refused the request (status {resp.status_code})."
+            + (f" {msg}" if msg else "")
+            + extra,
+            status_code=resp.status_code,
+        )
+
+    if resp.status_code == 429:
+        msg = _extract_surveycto_error_message(resp)
+        raise ApiAccessError(
+            f"SurveyCTO rate limit hit (429)."
+            + (f" {msg}" if msg else " Please retry shortly."),
+            status_code=resp.status_code,
+        )
+
+    if resp.status_code >= 400:
+        msg = _extract_surveycto_error_message(resp)
+        raise ApiAccessError(
+            f"SurveyCTO submissions request failed with status {resp.status_code}."
+            + (f" {msg}" if msg else ""),
             status_code=resp.status_code,
         )
 
@@ -345,7 +337,6 @@ async def fetch_wide_json_submissions(
     if not isinstance(data, list):
         raise FormListParseError("SurveyCTO wide JSON endpoint returned unexpected JSON shape (expected list).")
 
-    # Ensure dict rows
     rows: list[dict[str, Any]] = []
     for item in data:
         if isinstance(item, dict):
