@@ -9,43 +9,17 @@ from app.models.last_sync import LastSyncMetadata
 from app.models.sync_job import SyncJob
 
 
-def _safe_load_json(value: str | None) -> dict[str, Any] | None:
-    if not value:
-        return None
-    try:
-        parsed = json.loads(value)
-        if isinstance(parsed, dict):
-            return parsed
-        return None
-    except Exception:
-        return None
-
-
-def create_sync_job(
-    name: str,
-    source: str,
-    target: str,
-    config: dict[str, Any] | None = None,
-) -> SyncJob:
+def create_sync_job(name: str, source: str, target: str, config: dict[str, Any] | None = None) -> SyncJob:
     timestamp = datetime.now(tz=timezone.utc)
-    config_json = json.dumps(config) if config is not None else None
+    config_json = json.dumps(config or {}, ensure_ascii=False)
 
     with get_connection() as connection:
         cursor = connection.execute(
             """
-            INSERT INTO sync_jobs (name, source, target, status, created_at, updated_at, last_error, config_json)
+            INSERT INTO sync_jobs (name, source, target, status, created_at, updated_at, last_error, config)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                name,
-                source,
-                target,
-                "queued",
-                timestamp.isoformat(),
-                timestamp.isoformat(),
-                None,
-                config_json,
-            ),
+            (name, source, target, "queued", timestamp.isoformat(), timestamp.isoformat(), None, config_json),
         )
         connection.commit()
         job_id = cursor.lastrowid
@@ -59,22 +33,24 @@ def create_sync_job(
         created_at=timestamp,
         updated_at=timestamp,
         last_error=None,
-        config=config,
+        config=config or {},
     )
 
 
 def list_sync_jobs() -> list[SyncJob]:
     with get_connection() as connection:
         rows = connection.execute(
-            """
-            SELECT id, name, source, target, status, created_at, updated_at, last_error, config_json
-            FROM sync_jobs
-            ORDER BY id DESC
-            """
+            "SELECT id, name, source, target, status, created_at, updated_at, last_error, config FROM sync_jobs"
         ).fetchall()
 
     jobs: list[SyncJob] = []
     for row in rows:
+        cfg = {}
+        try:
+            cfg = json.loads(row["config"] or "{}")
+        except Exception:
+            cfg = {}
+
         jobs.append(
             SyncJob(
                 id=row["id"],
@@ -85,10 +61,39 @@ def list_sync_jobs() -> list[SyncJob]:
                 created_at=datetime.fromisoformat(row["created_at"]),
                 updated_at=datetime.fromisoformat(row["updated_at"]),
                 last_error=row["last_error"],
-                config=_safe_load_json(row["config_json"]),
+                config=cfg,
             )
         )
     return jobs
+
+
+def get_sync_job(job_id: int) -> SyncJob | None:
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT id, name, source, target, status, created_at, updated_at, last_error, config FROM sync_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    cfg = {}
+    try:
+        cfg = json.loads(row["config"] or "{}")
+    except Exception:
+        cfg = {}
+
+    return SyncJob(
+        id=row["id"],
+        name=row["name"],
+        source=row["source"],
+        target=row["target"],
+        status=row["status"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+        last_error=row["last_error"],
+        config=cfg,
+    )
 
 
 def record_sync_completion(job_id: int, status: str, last_error: str | None = None) -> None:

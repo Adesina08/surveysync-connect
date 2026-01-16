@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable
+from typing import Any, Dict, Iterable
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ElementTree
 
@@ -296,3 +296,58 @@ async def download_form_wide_json(session_token: str, form_id: str, date: str = 
     if not isinstance(payload, list):
         raise FormListParseError("SurveyCTO wide JSON response is not a list.")
     return payload
+
+
+def _datetime_to_epoch_seconds(dt: datetime | None) -> int:
+    if dt is None:
+        return 0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.astimezone(timezone.utc).timestamp())
+
+
+async def fetch_wide_json_submissions(
+    session_token: str,
+    form_id: str,
+    since_dt: datetime | None,
+) -> list[dict[str, Any]]:
+    session = _SESSIONS.get(session_token)
+    if not session:
+        raise InvalidSessionError("Session token is invalid or expired.")
+
+    date_param = _datetime_to_epoch_seconds(since_dt)
+    url = f"{session.server_url}/api/v2/forms/data/wide/json/{form_id}?date={date_param}"
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0), follow_redirects=True) as client:
+            resp = await client.get(url, auth=(session.username, session.password))
+    except httpx.RequestError as exc:
+        raise ServerConnectionError("Unable to reach the SurveyCTO server.") from exc
+
+    # SurveyCTO “quiet period” / precondition behavior for full pulls
+    if resp.status_code == 417:
+        return []
+
+    if resp.status_code in {401, 403}:
+        raise AuthenticationError("SurveyCTO credentials are invalid or access is denied.")
+
+    if resp.status_code >= 400:
+        raise ApiAccessError(
+            f"SurveyCTO submissions request failed with status {resp.status_code}.",
+            status_code=resp.status_code,
+        )
+
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise FormListParseError("SurveyCTO submissions response was not valid JSON.") from exc
+
+    if not isinstance(data, list):
+        raise FormListParseError("SurveyCTO wide JSON endpoint returned unexpected JSON shape (expected list).")
+
+    # Ensure dict rows
+    rows: list[dict[str, Any]] = []
+    for item in data:
+        if isinstance(item, dict):
+            rows.append(item)
+    return rows
