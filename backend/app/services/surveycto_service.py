@@ -262,9 +262,22 @@ async def download_form_wide_json(session_token: str, form_id: str, date: str = 
     url = f"{session.server_url}/api/v2/forms/data/wide/json/{form_id}"
     headers = {"Accept": "application/json", "User-Agent": "SurveySync Connect"}
 
+    params = {"date": date} if date and date != "0" else {}
+
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(60.0), follow_redirects=True) as client:
-            resp = await client.get(url, params={"date": date}, auth=(session.username, session.password), headers=headers)
+            resp = await client.get(
+                url,
+                params=params,
+                auth=(session.username, session.password),
+                headers=headers,
+            )
+            if resp.status_code == 412 and params:
+                resp = await client.get(
+                    url,
+                    auth=(session.username, session.password),
+                    headers=headers,
+                )
     except httpx.RequestError as exc:
         raise ServerConnectionError("Unable to reach the SurveyCTO server.") from exc
 
@@ -283,4 +296,3 @@ async def download_form_wide_json(session_token: str, form_id: str, date: str = 
     if not isinstance(payload, list):
         raise FormListParseError("SurveyCTO wide JSON response is not a list.")
     return payload
-
