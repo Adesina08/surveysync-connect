@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import psycopg
 from psycopg import sql
@@ -209,6 +209,117 @@ def create_table(
         conn.close()
 
 
+def delete_all_rows(creds: PostgresCredentials, schema: str, table: str) -> None:
+    conn = _connect(creds)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("DELETE FROM {}.{}").format(
+                    sql.Identifier(schema),
+                    sql.Identifier(table),
+                )
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def insert_rows(
+    creds: PostgresCredentials,
+    schema: str,
+    table: str,
+    columns: list[str],
+    rows: Iterable[dict[str, Any]],
+) -> int:
+    if not columns:
+        return 0
+    data = [tuple(row.get(col) for col in columns) for row in rows]
+    if not data:
+        return 0
+    conn = _connect(creds)
+    try:
+        with conn.cursor() as cur:
+            stmt = sql.SQL("INSERT INTO {}.{} ({}) VALUES ({})").format(
+                sql.Identifier(schema),
+                sql.Identifier(table),
+                sql.SQL(", ").join(sql.Identifier(c) for c in columns),
+                sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+            )
+            cur.executemany(stmt, data)
+        conn.commit()
+    finally:
+        conn.close()
+    return len(data)
+
+
+def upsert_rows(
+    creds: PostgresCredentials,
+    schema: str,
+    table: str,
+    columns: list[str],
+    rows: list[dict[str, Any]],
+    conflict_column: str,
+) -> tuple[int, int]:
+    if not columns:
+        return 0, 0
+    if conflict_column not in columns:
+        raise PostgresQueryError(f"Primary key column '{conflict_column}' is not in target columns.")
+
+    keys = [row.get(conflict_column) for row in rows if row.get(conflict_column) is not None]
+    existing_keys = _fetch_existing_keys(creds, schema, table, conflict_column, keys)
+
+    inserted = 0
+    updated = 0
+    for row in rows:
+        key = row.get(conflict_column)
+        if key is None or key not in existing_keys:
+            inserted += 1
+        else:
+            updated += 1
+
+    data = [tuple(row.get(col) for col in columns) for row in rows]
+    if not data:
+        return 0, 0
+
+    conn = _connect(creds)
+    try:
+        with conn.cursor() as cur:
+            update_cols = [c for c in columns if c != conflict_column]
+            if update_cols:
+                update_stmt = sql.SQL(", ").join(
+                    sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(c), sql.Identifier(c))
+                    for c in update_cols
+                )
+                stmt = sql.SQL(
+                    "INSERT INTO {}.{} ({}) VALUES ({}) "
+                    "ON CONFLICT ({}) DO UPDATE SET {}"
+                ).format(
+                    sql.Identifier(schema),
+                    sql.Identifier(table),
+                    sql.SQL(", ").join(sql.Identifier(c) for c in columns),
+                    sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+                    sql.Identifier(conflict_column),
+                    update_stmt,
+                )
+            else:
+                stmt = sql.SQL(
+                    "INSERT INTO {}.{} ({}) VALUES ({}) "
+                    "ON CONFLICT ({}) DO NOTHING"
+                ).format(
+                    sql.Identifier(schema),
+                    sql.Identifier(table),
+                    sql.SQL(", ").join(sql.Identifier(c) for c in columns),
+                    sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+                    sql.Identifier(conflict_column),
+                )
+            cur.executemany(stmt, data)
+        conn.commit()
+    finally:
+        conn.close()
+
+    return inserted, updated
+
+
 # -----------------------
 # Type helpers
 # -----------------------
@@ -264,3 +375,27 @@ def _normalize_pg_type(udt_name: str) -> str:
         "jsonb": "JSONB",
     }
     return m.get((udt_name or "").lower(), "TEXT")
+
+
+def _fetch_existing_keys(
+    creds: PostgresCredentials,
+    schema: str,
+    table: str,
+    column: str,
+    keys: list[Any],
+) -> set[Any]:
+    if not keys:
+        return set()
+    conn = _connect(creds)
+    try:
+        with conn.cursor() as cur:
+            stmt = sql.SQL("SELECT {} FROM {}.{} WHERE {} = ANY(%s)").format(
+                sql.Identifier(column),
+                sql.Identifier(schema),
+                sql.Identifier(table),
+                sql.Identifier(column),
+            )
+            cur.execute(stmt, (keys,))
+            return {row[0] for row in cur.fetchall()}
+    finally:
+        conn.close()

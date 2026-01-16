@@ -28,7 +28,7 @@ type SyncStatus = "ready" | "syncing" | "complete" | "failed";
 
 const SyncExecution = ({ onComplete, onRestart }: SyncExecutionProps) => {
   const { state, reset } = useSyncContext();
-  const { selectedForm, selectedSchema, selectedTable, createNewTable, newTableName, syncMode } = state;
+  const { selectedForm, selectedSchema, selectedTable, createNewTable, newTableName, syncMode, sessionToken } = state;
   
   const [status, setStatus] = useState<SyncStatus>("ready");
   const [progress, setProgress] = useState<SyncProgressType | null>(null);
@@ -90,6 +90,7 @@ const SyncExecution = ({ onComplete, onRestart }: SyncExecutionProps) => {
       syncMode,
       primaryKeyField: 'KEY',
       createNewTable,
+      sessionToken: sessionToken ?? undefined,
     });
     
     setProgress(initialProgress);
