@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Dict, Optional
 
+import psycopg2
+from psycopg2 import sql
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
@@ -84,11 +86,136 @@ class CreateTableResponse(BaseModel):
 # Helpers
 # -------------------------
 
-def _ensure_connected() -> postgres_service.PostgresCredentials:
+_ALLOWED_TYPES = {
+    "TEXT",
+    "INTEGER",
+    "BIGINT",
+    "DOUBLE PRECISION",
+    "NUMERIC",
+    "BOOLEAN",
+    "DATE",
+    "TIMESTAMP",
+    "TIMESTAMPTZ",
+    "JSONB",
+}
+
+
+def _coerce_allowed_type(t: str) -> str:
+    normalized = t.strip().upper()
+    if normalized == "TIMESTAMP WITH TIME ZONE":
+        normalized = "TIMESTAMPTZ"
+    if normalized == "TIMESTAMP WITHOUT TIME ZONE":
+        normalized = "TIMESTAMP"
+    if normalized not in _ALLOWED_TYPES:
+        return "TEXT"
+    return normalized
+
+
+def _normalize_pg_type(udt_name: str) -> str:
+    mapping = {
+        "text": "TEXT",
+        "varchar": "TEXT",
+        "bpchar": "TEXT",
+        "int2": "INTEGER",
+        "int4": "INTEGER",
+        "int8": "BIGINT",
+        "float4": "DOUBLE PRECISION",
+        "float8": "DOUBLE PRECISION",
+        "numeric": "NUMERIC",
+        "bool": "BOOLEAN",
+        "date": "DATE",
+        "timestamp": "TIMESTAMP",
+        "timestamptz": "TIMESTAMPTZ",
+        "json": "JSONB",
+        "jsonb": "JSONB",
+    }
+    return mapping.get((udt_name or "").lower(), "TEXT")
+
+
+def _ensure_connected() -> None:
     try:
-        return postgres_session.get_credentials()
+        postgres_service.get_credentials()
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+def _connect():
+    _ensure_connected()
+    try:
+        return postgres_service.connect()
+    except psycopg2.Error as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+
+
+def _fetch_schemas(conn) -> list[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT schema_name
+            FROM information_schema.schemata
+            WHERE schema_name NOT IN ('pg_catalog', 'information_schema')
+            ORDER BY schema_name
+            """
+        )
+        return [r[0] for r in cur.fetchall()]
+
+
+def _fetch_tables(conn, schema: str) -> list[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = %s
+              AND table_type = 'BASE TABLE'
+            ORDER BY table_name
+            """,
+            (schema,),
+        )
+        return [r[0] for r in cur.fetchall()]
+
+
+def _fetch_columns(conn, schema: str, table: str) -> list[PostgresColumn]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                c.column_name,
+                c.udt_name,
+                (c.is_nullable = 'YES') AS is_nullable
+            FROM information_schema.columns c
+            WHERE c.table_schema = %s
+              AND c.table_name = %s
+            ORDER BY c.ordinal_position
+            """,
+            (schema, table),
+        )
+        cols = cur.fetchall()
+
+        cur.execute(
+            """
+            SELECT kcu.column_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+             AND tc.table_schema = kcu.table_schema
+            WHERE tc.constraint_type = 'PRIMARY KEY'
+              AND tc.table_schema = %s
+              AND tc.table_name = %s
+            """,
+            (schema, table),
+        )
+        pk_cols = {r[0] for r in cur.fetchall()}
+
+    return [
+        PostgresColumn(
+            name=name,
+            type=_normalize_pg_type(udt_name),
+            nullable=bool(is_nullable),
+            isPrimaryKey=name in pk_cols,
+        )
+        for (name, udt_name, is_nullable) in cols
+    ]
 
 
 def _map_surveycto_type_to_pg(field_type: str) -> str:
@@ -121,7 +248,7 @@ def connect(credentials: PostgresCredentials) -> PostgresConnectionResponse:
     if not credentials.password.strip():
         return PostgresConnectionResponse(success=False, error="Password is required")
 
-    creds = postgres_service.PostgresCredentials(
+    creds = postgres_service.PgCredentials(
         host=credentials.host.strip(),
         port=int(credentials.port),
         database=credentials.database.strip(),
@@ -131,37 +258,36 @@ def connect(credentials: PostgresCredentials) -> PostgresConnectionResponse:
     )
 
     try:
-        postgres_service.test_connection(creds)
-    except postgres_service.PostgresConnectionError as exc:
+        conn = psycopg2.connect(
+            host=creds.host,
+            port=creds.port,
+            dbname=creds.database,
+            user=creds.username,
+            password=creds.password,
+            sslmode=creds.sslmode,
+            connect_timeout=10,
+        )
+    except psycopg2.Error as exc:
         return PostgresConnectionResponse(success=False, error=str(exc))
 
-    # ✅ store in shared session (so sync_engine can access it)
+    postgres_service.set_credentials(creds)
     postgres_session.set_credentials(creds)
 
-    # return schemas + tables + columns (frontend expects columns)
     try:
         schemas: list[PostgresSchema] = []
-        schema_names = postgres_service.list_schemas(creds)
+        schema_names = _fetch_schemas(conn)
         for s in schema_names:
-            table_names = postgres_service.list_tables(creds, s)
+            table_names = _fetch_tables(conn, s)
             tables: list[PostgresTable] = []
             for t in table_names:
-                cols = postgres_service.get_table_columns(creds, s, t)
-                pk = next((c.name for c in cols if c.is_primary_key), None)
+                cols = _fetch_columns(conn, s, t)
+                pk = next((c.name for c in cols if c.isPrimaryKey), None)
                 tables.append(
                     PostgresTable(
                         name=t,
                         primaryKey=pk,
                         rowCount=0,
-                        columns=[
-                            PostgresColumn(
-                                name=c.name,
-                                type=c.type,
-                                nullable=c.nullable,
-                                isPrimaryKey=c.is_primary_key,
-                            )
-                            for c in cols
-                        ],
+                        columns=cols,
                     )
                 )
             schemas.append(PostgresSchema(name=s, tables=tables))
@@ -169,76 +295,66 @@ def connect(credentials: PostgresCredentials) -> PostgresConnectionResponse:
         return PostgresConnectionResponse(success=True, schemas=schemas)
     except Exception as exc:
         return PostgresConnectionResponse(success=False, error=f"Connected, but failed to load schemas: {exc}")
+    finally:
+        conn.close()
 
 
 @router.get("/schemas", response_model=list[PostgresSchema])
 def list_schemas() -> list[PostgresSchema]:
-    creds = _ensure_connected()
+    conn = _connect()
+    try:
+        schema_names = _fetch_schemas(conn)
+        result: list[PostgresSchema] = []
 
-    schema_names = postgres_service.list_schemas(creds)
-    result: list[PostgresSchema] = []
+        for s in schema_names:
+            table_names = _fetch_tables(conn, s)
+            tables: list[PostgresTable] = []
+            for t in table_names:
+                cols = _fetch_columns(conn, s, t)
+                pk = next((c.name for c in cols if c.isPrimaryKey), None)
+                tables.append(
+                    PostgresTable(
+                        name=t,
+                        primaryKey=pk,
+                        rowCount=0,
+                        columns=cols,
+                    )
+                )
+            result.append(PostgresSchema(name=s, tables=tables))
 
-    for s in schema_names:
-        table_names = postgres_service.list_tables(creds, s)
+        return result
+    finally:
+        conn.close()
+
+
+@router.get("/schemas/{schema_name}/tables", response_model=list[PostgresTable])
+def list_tables(schema_name: str) -> list[PostgresTable]:
+    conn = _connect()
+    try:
+        table_names = _fetch_tables(conn, schema_name)
         tables: list[PostgresTable] = []
         for t in table_names:
-            cols = postgres_service.get_table_columns(creds, s, t)
-            pk = next((c.name for c in cols if c.is_primary_key), None)
+            cols = _fetch_columns(conn, schema_name, t)
+            pk = next((c.name for c in cols if c.isPrimaryKey), None)
             tables.append(
                 PostgresTable(
                     name=t,
                     primaryKey=pk,
                     rowCount=0,
-                    columns=[
-                        PostgresColumn(
-                            name=c.name,
-                            type=c.type,
-                            nullable=c.nullable,
-                            isPrimaryKey=c.is_primary_key,
-                        )
-                        for c in cols
-                    ],
+                    columns=cols,
                 )
             )
-        result.append(PostgresSchema(name=s, tables=tables))
-
-    return result
-
-
-@router.get("/schemas/{schema_name}/tables", response_model=list[PostgresTable])
-def list_tables(schema_name: str) -> list[PostgresTable]:
-    creds = _ensure_connected()
-
-    table_names = postgres_service.list_tables(creds, schema_name)
-    tables: list[PostgresTable] = []
-    for t in table_names:
-        cols = postgres_service.get_table_columns(creds, schema_name, t)
-        pk = next((c.name for c in cols if c.is_primary_key), None)
-        tables.append(
-            PostgresTable(
-                name=t,
-                primaryKey=pk,
-                rowCount=0,
-                columns=[
-                    PostgresColumn(
-                        name=c.name,
-                        type=c.type,
-                        nullable=c.nullable,
-                        isPrimaryKey=c.is_primary_key,
-                    )
-                    for c in cols
-                ],
-            )
-        )
-    return tables
+        return tables
+    finally:
+        conn.close()
 
 
 @router.post("/validate-schema", response_model=SchemaCompatibility)
 def validate_schema(payload: ValidateSchemaRequest) -> SchemaCompatibility:
-    creds = _ensure_connected()
+    conn = _connect()
 
     try:
-        table_names = postgres_service.list_tables(creds, payload.targetSchema)
+        table_names = _fetch_tables(conn, payload.targetSchema)
         if payload.targetTable not in table_names:
             return SchemaCompatibility(
                 compatible=False,
@@ -250,8 +366,8 @@ def validate_schema(payload: ValidateSchemaRequest) -> SchemaCompatibility:
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to validate schema: {exc}") from exc
 
-    cols = postgres_service.get_table_columns(creds, payload.targetSchema, payload.targetTable)
-    table_col_map: Dict[str, postgres_service.ColumnInfo] = {c.name: c for c in cols}
+    cols = _fetch_columns(conn, payload.targetSchema, payload.targetTable)
+    table_col_map: Dict[str, PostgresColumn] = {c.name: c for c in cols}
 
     form_names = {f.name for f in payload.formFields}
     table_names_set = set(table_col_map.keys())
@@ -268,7 +384,7 @@ def validate_schema(payload: ValidateSchemaRequest) -> SchemaCompatibility:
                 type_mismatches.append({"field": f.name, "expected": expected, "actual": actual})
 
     form_pk = next((f.name for f in payload.formFields if f.isPrimaryKey), None)
-    table_pk = next((c.name for c in cols if c.is_primary_key), None)
+    table_pk = next((c.name for c in cols if c.isPrimaryKey), None)
     pk_match = (form_pk is not None) and (table_pk == form_pk)
 
     compatible = (len(missing) == 0) and (len(type_mismatches) == 0)
@@ -284,8 +400,6 @@ def validate_schema(payload: ValidateSchemaRequest) -> SchemaCompatibility:
 
 @router.post("/tables", response_model=CreateTableResponse)
 def create_table(payload: CreateTableRequest) -> CreateTableResponse:
-    creds = _ensure_connected()
-
     if not payload.schemaName.strip():
         return CreateTableResponse(success=False, error="schemaName is required")
     if not payload.tableName.strip():
@@ -293,17 +407,36 @@ def create_table(payload: CreateTableRequest) -> CreateTableResponse:
 
     pk = next((c.name for c in payload.columns if c.isPrimaryKey), None)
 
+    conn = _connect()
     try:
-        postgres_service.create_table(
-            creds=creds,
-            schema=payload.schemaName,
-            table=payload.tableName,
-            columns=[c.model_dump() for c in payload.columns],
-            primary_key=pk,
-        )
-    except postgres_service.PostgresServiceError as exc:
-        return CreateTableResponse(success=False, error=str(exc))
+        with conn.cursor() as cur:
+            cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}")
+                        .format(sql.Identifier(payload.schemaName)))
+
+            col_defs: list[sql.SQL] = []
+            for c in payload.columns:
+                col_type = _coerce_allowed_type(c.type)
+                col_defs.append(
+                    sql.SQL("{} {} {}").format(
+                        sql.Identifier(c.name),
+                        sql.SQL(col_type),
+                        sql.SQL("NULL" if c.nullable else "NOT NULL"),
+                    )
+                )
+
+            if pk:
+                col_defs.append(sql.SQL("PRIMARY KEY ({})").format(sql.Identifier(pk)))
+
+            stmt = sql.SQL("CREATE TABLE IF NOT EXISTS {}.{} ({})").format(
+                sql.Identifier(payload.schemaName),
+                sql.Identifier(payload.tableName),
+                sql.SQL(", ").join(col_defs),
+            )
+            cur.execute(stmt)
+        conn.commit()
     except Exception as exc:
         return CreateTableResponse(success=False, error=f"Failed to create table: {exc}")
+    finally:
+        conn.close()
 
     return CreateTableResponse(success=True)

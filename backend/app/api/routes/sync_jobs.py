@@ -4,10 +4,10 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Any, Dict, Literal, Optional
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from app.services import postgres_service, postgres_session, surveycto_service, sync_engine
+from app.services import sync_engine, sync_runner
 
 router = APIRouter(prefix="/api/sync-jobs", tags=["sync-jobs"])
 
@@ -60,18 +60,6 @@ def _build_name(form_id: str, schema: str, table: str) -> str:
     return name[:200]
 
 
-def _utc_to_epoch_seconds(value: datetime | None) -> str:
-    if value is None:
-        return "0"
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return str(int(value.astimezone(timezone.utc).timestamp()))
-
-
-def _build_row_payload(row: dict, columns: list[str]) -> dict:
-    return {col: row.get(col) for col in columns}
-
-
 async def _run_sync(job_id: int, payload: SyncJobCreateRequest) -> None:
     progress = _PROGRESS[job_id]
     progress.status = "running"
@@ -80,74 +68,18 @@ async def _run_sync(job_id: int, payload: SyncJobCreateRequest) -> None:
         if not payload.sessionToken:
             raise ValueError("SurveyCTO session token is required.")
 
-        try:
-            creds = postgres_session.get_credentials()
-        except RuntimeError as exc:
-            raise ValueError(str(exc)) from exc
-
-        source = f"surveycto:{payload.formId}"
-        target = f"postgres:{payload.targetSchema}.{payload.targetTable}"
-        last_sync = sync_engine.get_last_sync(source, target)
-        date_param = _utc_to_epoch_seconds(last_sync.last_synced_at if last_sync else None)
-
-        submissions = await surveycto_service.download_form_wide_json(
-            payload.sessionToken,
-            payload.formId,
-            date=date_param,
+        result = await asyncio.to_thread(
+            sync_runner.run_sync_job,
+            job_id=job_id,
+            session_token=payload.sessionToken,
         )
 
-        progress.totalRecords = len(submissions)
-
-        if progress.totalRecords == 0:
-            progress.status = "completed"
-            progress.completedAt = _utc_now_iso()
-            sync_engine.record_sync_completion(job_id, status="completed", last_error=None)
-            sync_engine.upsert_last_sync(source, target, datetime.now(tz=timezone.utc))
-            return
-
-        if payload.createNewTable:
-            raise ValueError("Automatic table creation is not implemented. Create the table first.")
-
-        cols = postgres_service.get_table_columns(creds, payload.targetSchema, payload.targetTable)
-        column_names = [c.name for c in cols]
-
-        if not column_names:
-            raise ValueError("Target table has no columns.")
-
-        primary_key = payload.primaryKeyField or next((c.name for c in cols if c.is_primary_key), None)
-
-        rows = [_build_row_payload(row, column_names) for row in submissions]
-
-        if payload.syncMode == "replace":
-            postgres_service.delete_all_rows(creds, payload.targetSchema, payload.targetTable)
-            inserted = postgres_service.insert_rows(creds, payload.targetSchema, payload.targetTable, column_names, rows)
-            progress.insertedRecords = inserted
-            progress.updatedRecords = 0
-            progress.processedRecords = progress.totalRecords
-        elif payload.syncMode == "insert":
-            inserted = postgres_service.insert_rows(creds, payload.targetSchema, payload.targetTable, column_names, rows)
-            progress.insertedRecords = inserted
-            progress.updatedRecords = 0
-            progress.processedRecords = progress.totalRecords
-        else:
-            if not primary_key:
-                raise ValueError("Primary key field is required for upsert mode.")
-            inserted, updated = postgres_service.upsert_rows(
-                creds,
-                payload.targetSchema,
-                payload.targetTable,
-                column_names,
-                rows,
-                primary_key,
-            )
-            progress.insertedRecords = inserted
-            progress.updatedRecords = updated
-            progress.processedRecords = progress.totalRecords
-
+        progress.totalRecords = result.get("rowsFetched", 0)
+        progress.processedRecords = result.get("rowsWritten", 0)
+        progress.insertedRecords = result.get("rowsWritten", 0)
+        progress.updatedRecords = 0
         progress.status = "completed"
         progress.completedAt = _utc_now_iso()
-        sync_engine.record_sync_completion(job_id, status="completed", last_error=None)
-        sync_engine.upsert_last_sync(source, target, datetime.now(tz=timezone.utc))
 
     except Exception as exc:
         progress.status = "failed"
@@ -209,6 +141,23 @@ def get_sync_job(job_id: int) -> SyncProgressResponse:
     if not progress:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync job not found")
     return progress
+
+
+class SyncExecuteResponse(BaseModel):
+    rowsFetched: int
+    rowsWritten: int
+
+
+@router.post("/{job_id}/execute", response_model=SyncExecuteResponse)
+def execute_sync_job(
+    job_id: int,
+    session_token: str = Query(..., description="Session token from /sessions"),
+) -> SyncExecuteResponse:
+    try:
+        result = sync_runner.run_sync_job(job_id=job_id, session_token=session_token)
+        return SyncExecuteResponse(**result)
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
 
 
 @router.delete("/completed", response_model=dict)
