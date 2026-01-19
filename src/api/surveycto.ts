@@ -48,9 +48,12 @@ function mapForm(form: SurveyCTOFormResponse): SurveyCTOForm {
     // Prefer title, but fall back to id to avoid crashing the UI.
     name: (form.title ?? '').trim() || form.form_id,
     version: normalizeVersion(form.version),
-    responses: -1,              // unknown
-    lastUpdated: "Unknown",
-    fields: [],                 // unknown
+    // Keep these undefined/unknown until we implement a metadata endpoint.
+    responses: -1,
+    lastUpdated: 'Unknown',
+    // IMPORTANT: leave as undefined so the UI shows "Unknown" instead of "0 fields".
+    // (The UI treats an empty array as 0.)
+    fields: undefined,
   };
 }
 
