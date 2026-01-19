@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, status
 from pydantic import BaseModel
 
-from app.services import sync_engine
+from app.services import sync_engine, sync_runner
 
 router = APIRouter(prefix="/api/sync-jobs", tags=["sync-jobs"])
 
@@ -21,17 +20,16 @@ class SyncJobCreateRequest(BaseModel):
     sessionToken: str | None = None  # important for actual sync runner
 
 
-class SyncJobResponse(BaseModel):
-    id: int
-    name: str
-    source: str
-    target: str
+class SyncProgressResponse(BaseModel):
+    jobId: int
     status: str
-    created_at: datetime
-    updated_at: datetime
-    last_error: str | None
-    last_synced_at: datetime | None
-    config: dict[str, Any] | None = None
+    processedRecords: int = 0
+    totalRecords: int = 0
+    insertedRecords: int = 0
+    updatedRecords: int = 0
+    errors: list[dict[str, Any]] = []
+    startedAt: str | None = None
+    completedAt: str | None = None
 
 
 def _build_name(form_id: str, schema: str, table: str) -> str:
@@ -39,8 +37,8 @@ def _build_name(form_id: str, schema: str, table: str) -> str:
     return name[:200]
 
 
-@router.post("", response_model=SyncJobResponse)
-def create_sync_job(request: SyncJobCreateRequest) -> SyncJobResponse:
+@router.post("", response_model=SyncProgressResponse)
+def create_sync_job(request: SyncJobCreateRequest, background: BackgroundTasks) -> SyncProgressResponse:
     if request.syncMode == "upsert" and not request.primaryKeyField:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -67,42 +65,19 @@ def create_sync_job(request: SyncJobCreateRequest) -> SyncJobResponse:
     }
 
     job = sync_engine.create_sync_job(name=name, source=source, target=target, config=config)
-    last_sync = sync_engine.get_last_sync(source, target)
-
-    return SyncJobResponse(
-        id=job.id,
-        name=job.name,
-        source=job.source,
-        target=job.target,
-        status=job.status,
-        created_at=job.created_at,
-        updated_at=job.updated_at,
-        last_error=job.last_error,
-        last_synced_at=last_sync.last_synced_at if last_sync else None,
-        config=job.config,
-    )
+    sync_engine.set_progress_running(job.id)
+    background.add_task(sync_runner.run_sync_job, job.id)
+    return sync_engine.get_progress(job.id)
 
 
-@router.get("", response_model=list[SyncJobResponse])
-def list_sync_jobs() -> list[SyncJobResponse]:
-    jobs = sync_engine.list_sync_jobs()
-    responses: list[SyncJobResponse] = []
+@router.get("", response_model=list[SyncProgressResponse])
+def list_sync_jobs() -> list[SyncProgressResponse]:
+    return sync_engine.list_progress()
 
-    for job in jobs:
-        last_sync = sync_engine.get_last_sync(job.source, job.target)
-        responses.append(
-            SyncJobResponse(
-                id=job.id,
-                name=job.name,
-                source=job.source,
-                target=job.target,
-                status=job.status,
-                created_at=job.created_at,
-                updated_at=job.updated_at,
-                last_error=job.last_error,
-                last_synced_at=last_sync.last_synced_at if last_sync else None,
-                config=job.config,
-            )
-        )
 
-    return responses
+@router.get("/{job_id}", response_model=SyncProgressResponse)
+def get_progress(job_id: int) -> SyncProgressResponse:
+    progress = sync_engine.get_progress(job_id)
+    if not progress:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    return progress

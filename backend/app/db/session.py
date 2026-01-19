@@ -51,4 +51,20 @@ def init_db() -> None:
             )
             """
         )
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sync_progress (
+                job_id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL,
+                processed_records INTEGER DEFAULT 0,
+                total_records INTEGER DEFAULT 0,
+                inserted_records INTEGER DEFAULT 0,
+                updated_records INTEGER DEFAULT 0,
+                errors_json TEXT DEFAULT '[]',
+                started_at TEXT,
+                completed_at TEXT
+            )
+            """
+        )
         connection.commit()

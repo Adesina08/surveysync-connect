@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -8,19 +7,6 @@ import psycopg2
 from psycopg2 import sql, extras
 
 from app.services import sync_engine, surveycto_service
-
-
-@dataclass
-class SyncRunResult:
-    job_id: int
-    status: str
-    processed_records: int
-    total_records: int
-    inserted_records: int
-    updated_records: int
-    errors: list[dict[str, Any]]
-    started_at: datetime
-    completed_at: datetime
 
 
 def _infer_pg_dsn_from_env() -> str:
@@ -45,24 +31,15 @@ def _infer_pg_dsn_from_env() -> str:
     return f"host={host} port={port} dbname={db} user={user} password={pw} sslmode={sslmode}"
 
 
-def run_sync_job(job_id: int) -> SyncRunResult:
-    started_at = datetime.now(tz=timezone.utc)
-    errors: list[dict[str, Any]] = []
+def _now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
 
+
+def run_sync_job(job_id: int) -> None:
     jobs = {j.id: j for j in sync_engine.list_sync_jobs()}
     job = jobs.get(job_id)
     if not job:
-        return SyncRunResult(
-            job_id=job_id,
-            status="failed",
-            processed_records=0,
-            total_records=0,
-            inserted_records=0,
-            updated_records=0,
-            errors=[{"message": f"Job {job_id} not found", "timestamp": started_at.isoformat()}],
-            started_at=started_at,
-            completed_at=datetime.now(tz=timezone.utc),
-        )
+        return
 
     cfg = job.config or {}
     form_id = cfg.get("formId")
@@ -74,18 +51,8 @@ def run_sync_job(job_id: int) -> SyncRunResult:
 
     if not (form_id and session_token and schema and table):
         msg = "Missing job config: formId/sessionToken/targetSchema/targetTable"
-        sync_engine.record_sync_completion(job_id, "failed", msg)
-        return SyncRunResult(
-            job_id=job_id,
-            status="failed",
-            processed_records=0,
-            total_records=0,
-            inserted_records=0,
-            updated_records=0,
-            errors=[{"message": msg, "timestamp": started_at.isoformat()}],
-            started_at=started_at,
-            completed_at=datetime.now(tz=timezone.utc),
-        )
+        sync_engine.finish_failed(job_id, msg)
+        return
 
     source = f"surveycto:{form_id}"
     target = f"postgres:{schema}.{table}"
@@ -94,106 +61,45 @@ def run_sync_job(job_id: int) -> SyncRunResult:
     since_dt = last_sync.last_synced_at if last_sync else None
 
     try:
-        # Fetch SurveyCTO wide JSON rows (incremental via date=epoch)
+        sync_engine.update_progress(job_id, status="running", startedAt=_now_iso())
         rows = _run_async_fetch(session_token=session_token, form_id=form_id, since_dt=since_dt)
-    except surveycto_service.SubmissionsFetchError as exc:
-        errors.append({"message": str(exc), "timestamp": datetime.now(tz=timezone.utc).isoformat()})
-        sync_engine.record_sync_completion(job_id, "failed", str(exc))
-        return SyncRunResult(
-            job_id=job_id,
-            status="failed",
-            processed_records=0,
-            total_records=0,
-            inserted_records=0,
-            updated_records=0,
-            errors=errors,
-            started_at=started_at,
-            completed_at=datetime.now(tz=timezone.utc),
-        )
-    except Exception as exc:
-        errors.append({"message": f"Unexpected error: {exc!r}", "timestamp": datetime.now(tz=timezone.utc).isoformat()})
-        sync_engine.record_sync_completion(job_id, "failed", str(exc))
-        return SyncRunResult(
-            job_id=job_id,
-            status="failed",
-            processed_records=0,
-            total_records=0,
-            inserted_records=0,
-            updated_records=0,
-            errors=errors,
-            started_at=started_at,
-            completed_at=datetime.now(tz=timezone.utc),
-        )
+        total = len(rows)
+        sync_engine.update_progress(job_id, totalRecords=total)
 
-    total = len(rows)
-    if total == 0:
-        # still mark completion and bump last sync to now (optional)
-        sync_engine.record_sync_completion(job_id, "completed", None)
-        sync_engine.upsert_last_sync(source, target, datetime.now(tz=timezone.utc))
-        return SyncRunResult(
-            job_id=job_id,
-            status="completed",
-            processed_records=0,
-            total_records=0,
-            inserted_records=0,
-            updated_records=0,
-            errors=[],
-            started_at=started_at,
-            completed_at=datetime.now(tz=timezone.utc),
-        )
+        if total == 0:
+            sync_engine.finish_success(job_id, inserted=0, updated=0)
+            sync_engine.upsert_last_sync(source, target, datetime.now(tz=timezone.utc))
+            return
 
-    # Determine columns from data
-    col_names = sorted({k for r in rows for k in r.keys() if k and isinstance(k, str)})
-    if pk not in col_names:
-        col_names.append(pk)  # ensure pk exists in insert list if sync_mode requires it
+        col_names = sorted({k for r in rows for k in r.keys() if k and isinstance(k, str)})
+        if pk not in col_names:
+            col_names.append(pk)
 
-    dsn = _infer_pg_dsn_from_env()
+        dsn = _infer_pg_dsn_from_env()
+        inserted = 0
+        updated = 0
 
-    inserted = 0
-    updated = 0
-
-    try:
         with psycopg2.connect(dsn) as conn:
             conn.autocommit = False
             with conn.cursor() as cur:
                 if sync_mode == "append":
                     inserted = _insert_append(cur, schema, table, col_names, rows)
                 else:
-                    # upsert by default
                     inserted, updated = _upsert(cur, schema, table, col_names, rows, pk)
-
             conn.commit()
-    except Exception as exc:
-        errors.append({"message": f"Postgres write failed: {exc}", "timestamp": datetime.now(tz=timezone.utc).isoformat()})
-        sync_engine.record_sync_completion(job_id, "failed", str(exc))
-        return SyncRunResult(
-            job_id=job_id,
-            status="failed",
-            processed_records=0,
-            total_records=total,
-            inserted_records=inserted,
-            updated_records=updated,
-            errors=errors,
-            started_at=started_at,
-            completed_at=datetime.now(tz=timezone.utc),
+
+        sync_engine.update_progress(
+            job_id,
+            processedRecords=total,
+            insertedRecords=inserted,
+            updatedRecords=updated,
         )
-
-    # Update last sync = now (or max CompletionDate if you want)
-    sync_engine.upsert_last_sync(source, target, datetime.now(tz=timezone.utc))
-    sync_engine.record_sync_completion(job_id, "completed", None)
-
-    completed_at = datetime.now(tz=timezone.utc)
-    return SyncRunResult(
-        job_id=job_id,
-        status="completed",
-        processed_records=total,
-        total_records=total,
-        inserted_records=inserted,
-        updated_records=updated,
-        errors=errors,
-        started_at=started_at,
-        completed_at=completed_at,
-    )
+        sync_engine.finish_success(job_id, inserted=inserted, updated=updated)
+        sync_engine.upsert_last_sync(source, target, datetime.now(tz=timezone.utc))
+    except surveycto_service.SubmissionsFetchError as exc:
+        sync_engine.finish_failed(job_id, str(exc))
+    except Exception as exc:
+        sync_engine.finish_failed(job_id, str(exc))
 
 
 def _run_async_fetch(session_token: str, form_id: str, since_dt: datetime | None) -> list[dict]:
