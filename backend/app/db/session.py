@@ -30,14 +30,15 @@ def init_db() -> None:
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                last_error TEXT
+                last_error TEXT,
+                config_json TEXT DEFAULT '{}'
             )
             """
         )
 
-        # Add config column if missing (migration)
-        if not _column_exists(connection, "sync_jobs", "config"):
-            connection.execute("ALTER TABLE sync_jobs ADD COLUMN config TEXT")
+        # Add config_json column if missing (migration)
+        if not _column_exists(connection, "sync_jobs", "config_json"):
+            connection.execute("ALTER TABLE sync_jobs ADD COLUMN config_json TEXT DEFAULT '{}'")
 
         connection.execute(
             """

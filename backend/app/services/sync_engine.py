@@ -2,24 +2,32 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any
 
 from app.db.session import get_connection
 from app.models.last_sync import LastSyncMetadata
 from app.models.sync_job import SyncJob
 
 
-def create_sync_job(name: str, source: str, target: str, config: dict[str, Any] | None = None) -> SyncJob:
+def create_sync_job(name: str, source: str, target: str, config: dict | None = None) -> SyncJob:
     timestamp = datetime.now(tz=timezone.utc)
-    config_json = json.dumps(config or {}, ensure_ascii=False)
+    config_json = json.dumps(config or {})
 
     with get_connection() as connection:
         cursor = connection.execute(
             """
-            INSERT INTO sync_jobs (name, source, target, status, created_at, updated_at, last_error, config)
+            INSERT INTO sync_jobs (name, source, target, status, created_at, updated_at, last_error, config_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (name, source, target, "queued", timestamp.isoformat(), timestamp.isoformat(), None, config_json),
+            (
+                name,
+                source,
+                target,
+                "queued",
+                timestamp.isoformat(),
+                timestamp.isoformat(),
+                None,
+                config_json,
+            ),
         )
         connection.commit()
         job_id = cursor.lastrowid
@@ -40,17 +48,15 @@ def create_sync_job(name: str, source: str, target: str, config: dict[str, Any] 
 def list_sync_jobs() -> list[SyncJob]:
     with get_connection() as connection:
         rows = connection.execute(
-            "SELECT id, name, source, target, status, created_at, updated_at, last_error, config FROM sync_jobs"
+            "SELECT id, name, source, target, status, created_at, updated_at, last_error, config_json FROM sync_jobs"
         ).fetchall()
 
     jobs: list[SyncJob] = []
     for row in rows:
-        cfg = {}
         try:
-            cfg = json.loads(row["config"] or "{}")
+            cfg = json.loads(row["config_json"] or "{}")
         except Exception:
             cfg = {}
-
         jobs.append(
             SyncJob(
                 id=row["id"],
@@ -65,35 +71,6 @@ def list_sync_jobs() -> list[SyncJob]:
             )
         )
     return jobs
-
-
-def get_sync_job(job_id: int) -> SyncJob | None:
-    with get_connection() as connection:
-        row = connection.execute(
-            "SELECT id, name, source, target, status, created_at, updated_at, last_error, config FROM sync_jobs WHERE id=?",
-            (job_id,),
-        ).fetchone()
-
-    if not row:
-        return None
-
-    cfg = {}
-    try:
-        cfg = json.loads(row["config"] or "{}")
-    except Exception:
-        cfg = {}
-
-    return SyncJob(
-        id=row["id"],
-        name=row["name"],
-        source=row["source"],
-        target=row["target"],
-        status=row["status"],
-        created_at=datetime.fromisoformat(row["created_at"]),
-        updated_at=datetime.fromisoformat(row["updated_at"]),
-        last_error=row["last_error"],
-        config=cfg,
-    )
 
 
 def record_sync_completion(job_id: int, status: str, last_error: str | None = None) -> None:
@@ -140,10 +117,8 @@ def get_last_sync(source: str, target: str) -> LastSyncMetadata | None:
             "SELECT id, source, target, last_synced_at FROM last_sync WHERE source = ? AND target = ?",
             (source, target),
         ).fetchone()
-
     if not row:
         return None
-
     return LastSyncMetadata(
         id=row["id"],
         source=row["source"],
