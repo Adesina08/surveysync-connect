@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+"""SurveyCTO routes.
+
+Important: the frontend expects the "classic" response shape for forms:
+  - form_id
+  - title
+  - version
+
+If we ever add extra metadata (responses, fields, etc), do it behind separate
+endpoints so the list-forms call stays fast and the UI can render "Unknown"
+instead of "0".
+"""
+
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
 
@@ -8,20 +20,10 @@ from app.services import surveycto_service
 router = APIRouter(prefix="/surveycto", tags=["surveycto"])
 
 
-class SurveyCTOField(BaseModel):
-    name: str
-    type: str
-    label: str
-    isPrimaryKey: bool = False
-
-
 class SurveyCTOFormResponse(BaseModel):
-    id: str
-    name: str
+    form_id: str
+    title: str
     version: str
-    responses: int = -1
-    lastUpdated: str = "Unknown"
-    fields: list[SurveyCTOField] = []
 
 
 @router.get("/forms", response_model=list[SurveyCTOFormResponse])
@@ -41,15 +43,11 @@ async def list_forms(
     except surveycto_service.FormListParseError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 
-    # We don't yet fetch real response counts/fields here (avoid heavy calls).
     return [
         SurveyCTOFormResponse(
-            id=f.form_id,
-            name=f.title,
+            form_id=f.form_id,
+            title=f.title,
             version=f.version or "1",
-            responses=-1,
-            lastUpdated="Unknown",
-            fields=[],
         )
         for f in forms
     ]

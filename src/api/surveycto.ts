@@ -9,7 +9,8 @@ type SurveyCTOSessionResponse = {
 
 type SurveyCTOFormResponse = {
   form_id: string;
-  title: string;
+  // SurveyCTO uses `title`, but some backends may omit it or return null.
+  title?: string | null;
   version: string;
 };
 
@@ -44,45 +45,32 @@ function normalizeVersion(version: string | undefined): string {
 function mapForm(form: SurveyCTOFormResponse): SurveyCTOForm {
   return {
     id: form.form_id,
-    name: form.title,           // <-- title comes from backend
+    // Prefer title, but fall back to id to avoid crashing the UI.
+    name: (form.title ?? '').trim() || form.form_id,
     version: normalizeVersion(form.version),
-    responses: -1,              // <-- unknown
-    lastUpdated: "Unknown",
-    fields: [],                 // <-- unknown; don’t treat as 0
+    // Keep these undefined/unknown until we implement a metadata endpoint.
+    responses: -1,
+    lastUpdated: 'Unknown',
+    // IMPORTANT: leave as undefined so the UI shows "Unknown" instead of "0 fields".
+    // (The UI treats an empty array as 0.)
+    fields: undefined,
   };
 }
 
-
 /**
  * Authenticates with SurveyCTO server and returns available forms
- * 
- * Real implementation would call:
- * POST /sessions
- * Body: { server_url, username, password }
  */
 export async function authenticateSurveyCTO(
   credentials: SurveyCTOCredentials
 ): Promise<SurveyCTOAuthResponse> {
-  // Validate input
   if (!credentials.serverName?.trim()) {
-    return {
-      success: false,
-      error: 'Server name is required',
-    };
+    return { success: false, error: 'Server name is required' };
   }
-
   if (!credentials.username?.trim()) {
-    return {
-      success: false,
-      error: 'Username is required',
-    };
+    return { success: false, error: 'Username is required' };
   }
-
   if (!credentials.password?.trim()) {
-    return {
-      success: false,
-      error: 'Password is required',
-    };
+    return { success: false, error: 'Password is required' };
   }
 
   const serverUrl = normalizeServerUrl(credentials.serverName);
@@ -99,10 +87,7 @@ export async function authenticateSurveyCTO(
     });
 
     if (!session.session_token) {
-      return {
-        success: false,
-        error: 'Authentication failed',
-      };
+      return { success: false, error: 'Authentication failed' };
     }
 
     setSessionToken(session.session_token);
@@ -124,51 +109,28 @@ export async function authenticateSurveyCTO(
   }
 }
 
-/**
- * Fetches forms for the current session
- * 
- * Real implementation would call:
- * GET /surveycto/forms?session_token=...
- */
 export async function fetchForms(): Promise<SurveyCTOForm[]> {
   const token = getStoredSessionToken();
-  if (!token) {
-    return [];
-  }
+  if (!token) return [];
   const forms = await apiRequest<SurveyCTOFormResponse[]>(
     `/surveycto/forms?session_token=${encodeURIComponent(token)}`
   );
   return forms.map(mapForm);
 }
 
-/**
- * Fetches a single form by ID with full field details
- * 
- * Real implementation would call:
- * GET /surveycto/forms
- */
 export async function fetchFormById(formId: string): Promise<SurveyCTOForm | null> {
   const forms = await fetchForms();
   return forms.find((form) => form.id === formId) ?? null;
 }
 
-/**
- * Logs out and clears the session
- */
 export function logout(): void {
   setSessionToken(null);
 }
 
-/**
- * Checks if there's an active session
- */
 export function isAuthenticated(): boolean {
   return getStoredSessionToken() !== null;
 }
 
-/**
- * Gets the current session token
- */
 export function getSessionToken(): string | null {
   return getStoredSessionToken();
 }
