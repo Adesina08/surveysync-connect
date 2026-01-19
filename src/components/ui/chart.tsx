@@ -19,6 +19,11 @@ type ChartContextProps = {
 
 const ChartContext = React.createContext<ChartContextProps | null>(null);
 
+function safeNumber(value: unknown, fallback = 0): number {
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 function useChart() {
   const context = React.useContext(ChartContext);
 
@@ -209,7 +214,7 @@ const ChartTooltipContent = React.forwardRef<
                       </div>
                       {item.value && (
                         <span className="font-mono font-medium tabular-nums text-foreground">
-                          {item.value.toLocaleString()}
+                          {safeNumber((item as any).value, 0).toLocaleString()}
                         </span>
                       )}
                     </div>

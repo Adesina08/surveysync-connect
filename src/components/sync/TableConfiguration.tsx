@@ -1,223 +1,179 @@
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
+import { useEffect, useMemo, useState } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Label } from "@/components/ui/label";
+import { Input } from "@/components/ui/input";
 import {
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
-  SelectValue,
+  SelectValue
 } from "@/components/ui/select";
-import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
-import { Table, Plus, ArrowRight, Key, Layers, CheckCircle2, AlertTriangle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useSyncContext } from "@/contexts/SyncContext";
+import { getSchemas, getTables } from "@/api/postgres";
+import { CheckCircle2, AlertTriangle, Table, Plus } from "lucide-react";
 
-interface TableConfigurationProps {
-  onContinue: () => void;
+function safeNumber(value: unknown, fallback = 0): number {
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) ? n : fallback;
 }
 
-const TableConfiguration = ({ onContinue }: TableConfigurationProps) => {
-  const {
-    state,
-    setSelectedSchema,
-    setSelectedTable,
-    setCreateNewTable,
-    setNewTableName,
-    setSyncMode,
-  } = useSyncContext();
+const TableConfiguration = ({ onNext, onBack }: { onNext: () => void; onBack: () => void }) => {
+  const { state, setSelectedSchema, setSelectedTable, setCreateNewTable, setNewTableName } = useSyncContext();
+  const { selectedSchema, selectedTable, createNewTable, newTableName, selectedForm } = state;
 
-  const {
-    schemas,
-    selectedSchema,
-    selectedTable,
-    createNewTable,
-    newTableName,
-    syncMode,
-    selectedForm,
-  } = state;
+  const [schemas, setSchemas] = useState<{ name: string }[]>([]);
+  const [tables, setTables] = useState<{ name: string; rowCount?: number }[]>([]);
+  const [loading, setLoading] = useState(false);
 
-  // Get tables for selected schema
-  const currentSchema = schemas.find(s => s.name === selectedSchema);
-  const tables = currentSchema?.tables || [];
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      try {
+        const loaded = await getSchemas();
+        setSchemas(loaded);
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
 
-  const isValid = selectedSchema && (createNewTable ? newTableName.trim() : selectedTable);
+  useEffect(() => {
+    (async () => {
+      if (!selectedSchema) return;
+      const loadedTables = await getTables(selectedSchema);
+      setTables(loadedTables);
+    })();
+  }, [selectedSchema]);
+
+  const canContinue = useMemo(() => {
+    if (createNewTable) return Boolean(newTableName?.trim());
+    return Boolean(selectedSchema && selectedTable);
+  }, [createNewTable, newTableName, selectedSchema, selectedTable]);
 
   return (
-    <Card className="w-full max-w-xl mx-auto shadow-card border-border/50 animate-fade-in">
-      <CardHeader className="pb-4">
-        <div className="w-14 h-14 rounded-xl gradient-primary flex items-center justify-center mx-auto mb-4 shadow-card">
-          <Table className="w-7 h-7 text-primary-foreground" />
-        </div>
-        <CardTitle className="text-xl text-center">Configure Target Table</CardTitle>
-        <CardDescription className="text-center">
-          Choose where to store your synced data
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-6">
-        <div className="space-y-3">
-          <Label className="text-sm font-medium">Schema</Label>
-          <Select value={selectedSchema || ""} onValueChange={setSelectedSchema}>
-            <SelectTrigger>
-              <SelectValue placeholder="Select a schema" />
-            </SelectTrigger>
-            <SelectContent>
-              {schemas.map((s) => (
-                <SelectItem key={s.name} value={s.name}>
-                  {s.name}
-                  <span className="text-muted-foreground ml-2">
-                    ({s.tables.length} tables)
-                  </span>
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
+    <div className="w-full max-w-2xl mx-auto space-y-6 animate-fade-in">
+      <Card className="shadow-card border-border/50">
+        <CardHeader className="pb-4">
+          <CardTitle className="text-lg">Target Table Setup</CardTitle>
+          <CardDescription>Select an existing table or create a new one</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-6">
+          <div className="space-y-3">
+            <Label className="text-sm font-medium">Schema</Label>
+            <Select value={selectedSchema || ""} onValueChange={(v) => setSelectedSchema(v)}>
+              <SelectTrigger>
+                <SelectValue placeholder={loading ? "Loading..." : "Choose a schema"} />
+              </SelectTrigger>
+              <SelectContent>
+                {schemas.map((s) => (
+                  <SelectItem key={s.name} value={s.name}>
+                    {s.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
 
-        <div className="space-y-3">
-          <Label className="text-sm font-medium">Table Selection</Label>
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-2 gap-4">
             <button
+              type="button"
+              className={cn(
+                "p-4 rounded-xl border text-left transition-all",
+                !createNewTable ? "border-primary bg-primary/5" : "border-border bg-background"
+              )}
               onClick={() => setCreateNewTable(false)}
-              className={cn(
-                "p-4 rounded-lg border text-left transition-all",
-                !createNewTable
-                  ? "border-primary bg-primary/5 shadow-card"
-                  : "border-border hover:border-primary/50"
-              )}
             >
-              <Layers className={cn(
-                "w-5 h-5 mb-2",
-                !createNewTable ? "text-primary" : "text-muted-foreground"
-              )} />
+              <Table className={cn("w-5 h-5 mb-2", !createNewTable ? "text-primary" : "text-muted-foreground")} />
               <p className="font-medium text-sm">Use Existing Table</p>
-              <p className="text-xs text-muted-foreground mt-1">
-                Sync to an existing PostgreSQL table
-              </p>
+              <p className="text-xs text-muted-foreground mt-1">Pick a table from your database</p>
             </button>
+
             <button
-              onClick={() => setCreateNewTable(true)}
+              type="button"
               className={cn(
-                "p-4 rounded-lg border text-left transition-all",
-                createNewTable
-                  ? "border-primary bg-primary/5 shadow-card"
-                  : "border-border hover:border-primary/50"
+                "p-4 rounded-xl border text-left transition-all",
+                createNewTable ? "border-primary bg-primary/5" : "border-border bg-background"
               )}
+              onClick={() => setCreateNewTable(true)}
             >
-              <Plus className={cn(
-                "w-5 h-5 mb-2",
-                createNewTable ? "text-primary" : "text-muted-foreground"
-              )} />
+              <Plus className={cn("w-5 h-5 mb-2", createNewTable ? "text-primary" : "text-muted-foreground")} />
               <p className="font-medium text-sm">Create New Table</p>
-              <p className="text-xs text-muted-foreground mt-1">
-                Auto-generate table from form schema
-              </p>
+              <p className="text-xs text-muted-foreground mt-1">Auto-generate table from form schema</p>
             </button>
           </div>
-        </div>
 
-        {!createNewTable ? (
-          <div className="space-y-3">
-            <Label className="text-sm font-medium">Select Table</Label>
-            {tables.length === 0 && selectedSchema ? (
-              <div className="flex items-center gap-2 p-3 rounded-lg bg-muted/50 border border-border">
-                <AlertTriangle className="w-4 h-4 text-muted-foreground" />
-                <p className="text-sm text-muted-foreground">
-                  No tables in this schema. Create a new table instead.
-                </p>
-              </div>
-            ) : (
-              <Select value={selectedTable || ""} onValueChange={setSelectedTable}>
-                <SelectTrigger>
-                  <SelectValue placeholder="Choose a table" />
-                </SelectTrigger>
-                <SelectContent>
-                  {tables.map((t) => (
-                    <SelectItem key={t.name} value={t.name}>
-                      {t.name}
-                      <span className="text-muted-foreground ml-2">
-                        ({t.rowCount.toLocaleString()} rows)
-                      </span>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
-            
-            {selectedTable && (
-              <div className="flex items-center gap-2 p-3 rounded-lg bg-success/10 border border-success/20 animate-fade-in">
-                <CheckCircle2 className="w-4 h-4 text-success" />
-                <p className="text-xs text-success">
-                  Schema compatible • Primary key: <code className="font-mono bg-success/20 px-1 rounded">KEY</code>
-                </p>
-              </div>
-            )}
-          </div>
-        ) : (
-          <div className="space-y-3">
-            <Label htmlFor="new-table" className="text-sm font-medium">
-              New Table Name
-            </Label>
-            <Input
-              id="new-table"
-              placeholder="e.g., household_survey_2024"
-              value={newTableName}
-              onChange={(e) => setNewTableName(e.target.value)}
-            />
-            {selectedForm && (
-              <p className="text-xs text-muted-foreground">
-                {selectedForm.fields.length > 0
-                  ? `Table will be created with ${selectedForm.fields.length} columns matching your SurveyCTO form fields`
-                  : "Form field details will load during sync when available."}
-              </p>
-            )}
-          </div>
-        )}
+          {!createNewTable ? (
+            <div className="space-y-3">
+              <Label className="text-sm font-medium">Select Table</Label>
 
-        <div className="space-y-3">
-          <Label className="text-sm font-medium flex items-center gap-2">
-            <Key className="w-4 h-4" />
-            Sync Mode
-          </Label>
-          <RadioGroup value={syncMode} onValueChange={(v) => setSyncMode(v as "insert" | "upsert")}>
-            <div className="flex items-start gap-3 p-3 rounded-lg border border-border hover:border-primary/50 transition-colors">
-              <RadioGroupItem value="upsert" id="upsert" className="mt-0.5" />
-              <div>
-                <Label htmlFor="upsert" className="font-medium cursor-pointer">
-                  Upsert (Recommended)
-                </Label>
-                <p className="text-xs text-muted-foreground mt-0.5">
-                  Insert new rows and update existing ones based on primary key
-                </p>
-              </div>
+              {tables.length === 0 && selectedSchema ? (
+                <div className="flex items-center gap-2 p-3 rounded-lg bg-muted/50 border border-border">
+                  <AlertTriangle className="w-4 h-4 text-muted-foreground" />
+                  <p className="text-sm text-muted-foreground">
+                    No tables in this schema. Create a new table instead.
+                  </p>
+                </div>
+              ) : (
+                <Select value={selectedTable || ""} onValueChange={setSelectedTable}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="Choose a table" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {tables.map((t) => (
+                      <SelectItem key={t.name} value={t.name}>
+                        {t.name}
+                        <span className="text-muted-foreground ml-2">
+                          ({safeNumber((t as any).rowCount, 0).toLocaleString()} rows)
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
+
+              {selectedTable && (
+                <div className="flex items-center gap-2 p-3 rounded-lg bg-success/10 border border-success/20 animate-fade-in">
+                  <CheckCircle2 className="w-4 h-4 text-success" />
+                  <p className="text-xs text-success">
+                    Schema compatible • Primary key:{" "}
+                    <code className="font-mono bg-success/20 px-1 rounded">KEY</code>
+                  </p>
+                </div>
+              )}
             </div>
-            <div className="flex items-start gap-3 p-3 rounded-lg border border-border hover:border-primary/50 transition-colors">
-              <RadioGroupItem value="insert" id="insert" className="mt-0.5" />
-              <div>
-                <Label htmlFor="insert" className="font-medium cursor-pointer">
-                  Insert Only
-                </Label>
-                <p className="text-xs text-muted-foreground mt-0.5">
-                  Only add new rows, skip duplicates
+          ) : (
+            <div className="space-y-3">
+              <Label htmlFor="new-table" className="text-sm font-medium">
+                New Table Name
+              </Label>
+              <Input
+                id="new-table"
+                placeholder="e.g., household_survey_2024"
+                value={newTableName}
+                onChange={(e) => setNewTableName(e.target.value)}
+              />
+              {selectedForm && (
+                <p className="text-xs text-muted-foreground">
+                  Table will be created based on the fields in: <strong>{selectedForm.name}</strong>
                 </p>
-              </div>
+              )}
             </div>
-          </RadioGroup>
-        </div>
+          )}
 
-        <Button
-          variant="gradient"
-          size="lg"
-          className="w-full"
-          onClick={onContinue}
-          disabled={!isValid}
-        >
-          Continue to Sync
-          <ArrowRight className="w-4 h-4" />
-        </Button>
-      </CardContent>
-    </Card>
+          <div className="flex justify-between pt-2">
+            <Button variant="outline" onClick={onBack}>
+              Back
+            </Button>
+            <Button variant="gradient" onClick={onNext} disabled={!canContinue}>
+              Continue
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
   );
 };
 
