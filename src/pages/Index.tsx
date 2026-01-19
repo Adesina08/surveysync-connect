@@ -19,9 +19,7 @@ const steps = [
 const IndexContent = () => {
   const [currentStep, setCurrentStep] = useState(1);
 
-  const handleRestart = () => {
-    setCurrentStep(1);
-  };
+  const handleRestart = () => setCurrentStep(1);
 
   const renderStepContent = () => {
     switch (currentStep) {
@@ -32,14 +30,14 @@ const IndexContent = () => {
       case 3:
         return <DatabaseConnection onSuccess={() => setCurrentStep(4)} />;
       case 4:
-        return <TableConfiguration onContinue={() => setCurrentStep(5)} />;
-      case 5:
         return (
-          <SyncExecution
-            onComplete={() => {}}
-            onRestart={handleRestart}
+          <TableConfiguration
+            onBack={() => setCurrentStep(3)}
+            onContinue={() => setCurrentStep(5)}
           />
         );
+      case 5:
+        return <SyncExecution onComplete={() => {}} onRestart={handleRestart} />;
       default:
         return null;
     }
@@ -50,7 +48,6 @@ const IndexContent = () => {
       <Header />
 
       <main className="container mx-auto flex-1 px-6 py-8">
-        {/* Hero Section for Step 1 */}
         {currentStep === 1 && (
           <div className="text-center mb-12 animate-fade-in">
             <h1 className="text-4xl font-bold mb-4">
@@ -63,27 +60,20 @@ const IndexContent = () => {
           </div>
         )}
 
-        {/* Step Indicator */}
         <div className="max-w-3xl mx-auto mb-12">
           <StepIndicator
             steps={steps}
             currentStep={currentStep}
             onStepClick={(stepId) => {
-              if (stepId < currentStep) {
-                setCurrentStep(stepId);
-              }
+              // allow going back (or change this to always allow any step)
+              setCurrentStep(stepId);
             }}
           />
         </div>
 
-        {/* Step Content */}
-        <div className="mb-12">
-          {renderStepContent()}
-        </div>
-
+        <div className="mb-12">{renderStepContent()}</div>
       </main>
 
-      {/* Footer */}
       <footer className="text-center text-sm text-muted-foreground py-8 border-t border-border mt-auto">
         <p>© 2026 InicioNG Tech Team</p>
       </footer>
@@ -91,12 +81,10 @@ const IndexContent = () => {
   );
 };
 
-const Index = () => {
-  return (
-    <SyncProvider>
-      <IndexContent />
-    </SyncProvider>
-  );
-};
+const Index = () => (
+  <SyncProvider>
+    <IndexContent />
+  </SyncProvider>
+);
 
 export default Index;
