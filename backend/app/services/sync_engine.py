@@ -300,3 +300,51 @@ def get_last_sync(source: str, target: str) -> LastSyncMetadata | None:
         target=row["target"],
         last_synced_at=datetime.fromisoformat(row["last_synced_at"]),
     )
+
+
+
+
+# -----------------------------------------------------------------------------
+# Job lifecycle helpers (used by API routes)
+# -----------------------------------------------------------------------------
+
+
+def record_sync_completion(job_id: int, status: str, last_error: str | None) -> None:
+    """Update sync_jobs metadata for admin/debugging.
+
+    Note: progress is stored/updated via mark_progress(); this function just keeps
+    sync_jobs (status/last_error) aligned.
+    """
+    with get_connection() as connection:
+        connection.execute(
+            "UPDATE sync_jobs SET status = ?, updated_at = ?, last_error = ? WHERE id = ?",
+            (status, _utcnow().isoformat(), last_error, job_id),
+        )
+        connection.commit()
+
+
+def delete_sync_job(job_id: int) -> bool:
+    """Delete a job and its progress. Returns True if something was deleted."""
+    with get_connection() as connection:
+        cur1 = connection.execute("DELETE FROM sync_progress WHERE job_id = ?", (job_id,))
+        cur2 = connection.execute("DELETE FROM sync_jobs WHERE id = ?", (job_id,))
+        connection.commit()
+    return (cur1.rowcount or 0) > 0 or (cur2.rowcount or 0) > 0
+
+
+def clear_completed_jobs() -> int:
+    """Remove completed/failed jobs from storage. Returns number of jobs deleted."""
+    with get_connection() as connection:
+        ids = [
+            int(r["id"])
+            for r in connection.execute(
+                "SELECT id FROM sync_jobs WHERE status IN ('completed','failed')"
+            ).fetchall()
+        ]
+        if not ids:
+            return 0
+        connection.executemany("DELETE FROM sync_progress WHERE job_id = ?", [(i,) for i in ids])
+        connection.executemany("DELETE FROM sync_jobs WHERE id = ?", [(i,) for i in ids])
+        connection.commit()
+    return len(ids)
+
