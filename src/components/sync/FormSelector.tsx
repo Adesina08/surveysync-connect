@@ -16,33 +16,30 @@ const FormSelector = ({ onSelect }: FormSelectorProps) => {
   const [search, setSearch] = useState("");
   const [selectedFormId, setSelectedFormId] = useState<string | null>(null);
 
-  const filteredForms = state.forms.filter((form) =>
-    form.name.toLowerCase().includes(search.toLowerCase())
-  );
+  // Backend data can be incomplete (e.g., title/name missing). Be defensive.
+  const filteredForms = state.forms.filter((form) => {
+    const formName = (form?.name ?? "").toString();
+    return formName.toLowerCase().includes(search.toLowerCase());
+  });
 
   const handleSelect = (formId: string) => {
     setSelectedFormId(formId);
-    const form = state.forms.find(f => f.id === formId);
-    if (form) {
-      setSelectedForm(form);
-    }
+    const form = state.forms.find((f) => f.id === formId);
+    if (form) setSelectedForm(form);
   };
 
   const handleContinue = () => {
-    if (selectedFormId) {
-      onSelect(selectedFormId);
-    }
+    if (selectedFormId) onSelect(selectedFormId);
   };
 
-const formatDate = (dateString?: string) => {
-  if (!dateString) return "Unknown";
-  try {
-    return formatDistanceToNow(new Date(dateString), { addSuffix: true });
-  } catch {
-    return dateString;
-  }
-};
-
+  const formatDate = (dateString?: string) => {
+    if (!dateString) return "Unknown";
+    try {
+      return formatDistanceToNow(new Date(dateString), { addSuffix: true });
+    } catch {
+      return dateString;
+    }
+  };
 
   return (
     <Card className="w-full max-w-2xl mx-auto shadow-card border-border/50 animate-fade-in">
@@ -93,18 +90,26 @@ const formatDate = (dateString?: string) => {
                     >
                       <FileText className="w-5 h-5" />
                     </div>
+
                     <div>
-                      <h3 className="font-medium text-foreground">{form.name}</h3>
-                      <p className="text-xs text-muted-foreground mb-1">v{form.version}</p>
+                      <h3 className="font-medium text-foreground">{form.name ?? form.id}</h3>
+                      <p className="text-xs text-muted-foreground mb-1">v{form.version ?? "1"}</p>
+
                       <div className="flex items-center gap-4">
                         <span className="flex items-center gap-1 text-xs text-muted-foreground">
                           <Hash className="w-3 h-3" />
-                          {form.responses > 0 ? `${form.responses.toLocaleString()} responses` : "Responses: Unavailable"}
+                          {typeof form.responses === "number" && form.responses >= 0
+                            ? `${form.responses.toLocaleString()} responses`
+                            : "Responses: Unavailable"}
                         </span>
+
                         <span className="flex items-center gap-1 text-xs text-muted-foreground">
                           <Columns className="w-3 h-3" />
-                          {form.fields.length > 0 ? `${form.fields.length} fields` : "Fields: Unavailable"}
+                          {Array.isArray(form.fields)
+                            ? `${form.fields.length} fields`
+                            : "Fields: Unavailable"}
                         </span>
+
                         <span className="flex items-center gap-1 text-xs text-muted-foreground">
                           <Calendar className="w-3 h-3" />
                           {formatDate(form.lastUpdated)}
@@ -112,6 +117,7 @@ const formatDate = (dateString?: string) => {
                       </div>
                     </div>
                   </div>
+
                   {selectedFormId === form.id && (
                     <CheckCircle2 className="w-5 h-5 text-primary" />
                   )}
