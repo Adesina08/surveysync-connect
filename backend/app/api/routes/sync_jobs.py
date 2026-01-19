@@ -1,115 +1,136 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Path, status
+from pydantic import BaseModel, Field
 
-from app.services import sync_engine
+from app.services import sync_engine, sync_runner
+
 
 router = APIRouter(prefix="/api/sync-jobs", tags=["sync-jobs"])
 
 
-SyncModeIn = Literal["append", "upsert", "replace", "insert"]
+# -------------------------
+# Request/Response models to MATCH src/api/types.ts
+# -------------------------
 
-
-class SyncJobCreateRequest(BaseModel):
+class SyncJobConfig(BaseModel):
     formId: str
-    sessionToken: str
     targetSchema: str
     targetTable: str
-    syncMode: SyncModeIn = "upsert"
+    syncMode: Literal["insert", "upsert"] = "upsert"
     primaryKeyField: str | None = None
     createNewTable: bool = False
+    sessionToken: str = Field(..., description="SurveyCTO session token from /sessions")
 
 
-class SyncJobResponse(BaseModel):
-    id: int
-    name: str
-    source: str
-    target: str
-    status: str
-    created_at: datetime
-    updated_at: datetime
-    last_error: str | None
-    last_synced_at: datetime | None
-    config: dict[str, Any] | None = None
+class SyncError(BaseModel):
+    recordId: str
+    field: str | None = None
+    message: str
 
 
-def _build_name(form_id: str, schema: str, table: str) -> str:
-    name = f"sync_{form_id}_to_{schema}.{table}"
-    return name[:200]
+class SyncProgress(BaseModel):
+    jobId: str
+    status: Literal["pending", "running", "completed", "failed"]
+    processedRecords: int
+    totalRecords: int
+    insertedRecords: int
+    updatedRecords: int
+    errors: list[SyncError]
+    startedAt: str | None = None
+    completedAt: str | None = None
 
 
-def _normalize_sync_mode(mode: str) -> str:
-    # frontend may send "insert"; backend uses "append"
-    if mode == "insert":
-        return "append"
-    return mode
+def _progress_from_engine(progress: dict[str, Any]) -> SyncProgress:
+    # Ensure all fields exist exactly as the frontend expects
+    raw_errors = progress.get("errors") or []
+    errors: list[SyncError] = []
+    for e in raw_errors:
+        # tolerate older shapes
+        errors.append(
+            SyncError(
+                recordId=str(e.get("recordId") or e.get("id") or "unknown"),
+                field=e.get("field"),
+                message=str(e.get("message") or "Unknown error"),
+            )
+        )
+
+    return SyncProgress(
+        jobId=str(progress.get("jobId")),
+        status=progress.get("status", "pending"),
+        processedRecords=int(progress.get("processedRecords") or 0),
+        totalRecords=int(progress.get("totalRecords") or 0),
+        insertedRecords=int(progress.get("insertedRecords") or 0),
+        updatedRecords=int(progress.get("updatedRecords") or 0),
+        errors=errors,
+        startedAt=progress.get("startedAt"),
+        completedAt=progress.get("completedAt"),
+    )
 
 
-@router.post("", response_model=SyncJobResponse)
-def create_sync_job(request: SyncJobCreateRequest) -> SyncJobResponse:
-    normalized_mode = _normalize_sync_mode(request.syncMode)
+@router.get("", response_model=list[SyncProgress])
+def list_sync_jobs() -> list[SyncProgress]:
+    jobs = sync_engine.list_sync_jobs_progress()
+    return [_progress_from_engine(j) for j in jobs]
 
-    if normalized_mode == "upsert" and not request.primaryKeyField:
+
+@router.post("", response_model=SyncProgress)
+def create_sync_job(config: SyncJobConfig) -> SyncProgress:
+    if config.syncMode == "upsert" and not config.primaryKeyField:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="primaryKeyField is required when syncMode is 'upsert'.",
         )
 
-    source = f"surveycto:{request.formId}"
-    target = f"postgres:{request.targetSchema}.{request.targetTable}"
-    name = _build_name(request.formId, request.targetSchema, request.targetTable)
+    job_id = sync_engine.create_sync_job(config.model_dump())
 
-    config = {
-        "formId": request.formId,
-        "sessionToken": request.sessionToken,
-        "targetSchema": request.targetSchema,
-        "targetTable": request.targetTable,
-        "syncMode": normalized_mode,
-        "primaryKeyField": request.primaryKeyField,
-        "createNewTable": request.createNewTable,
-    }
+    progress = sync_engine.get_progress(job_id)
+    if not progress:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create sync job")
 
-    job = sync_engine.create_sync_job(name=name, source=source, target=target, config=config)
-    last_sync = sync_engine.get_last_sync(source, target)
+    return _progress_from_engine(progress)
 
-    return SyncJobResponse(
-        id=job.id,
-        name=job.name,
-        source=job.source,
-        target=job.target,
-        status=job.status,
-        created_at=job.created_at,
-        updated_at=job.updated_at,
-        last_error=job.last_error,
-        last_synced_at=last_sync.last_synced_at if last_sync else None,
-        config=job.config,
+
+@router.post("/{job_id}/run", response_model=SyncProgress)
+def run_sync_job(job_id: int = Path(..., ge=1)) -> SyncProgress:
+    # Mark running early so UI can react
+    sync_engine.mark_progress(
+        job_id,
+        status="running",
+        started_at=datetime.now(tz=timezone.utc),
     )
 
+    result = sync_runner.run_sync_job(job_id)
 
-@router.get("", response_model=list[SyncJobResponse])
-def list_sync_jobs() -> list[SyncJobResponse]:
-    jobs = sync_engine.list_sync_jobs()
-    responses: list[SyncJobResponse] = []
-
-    for job in jobs:
-        last_sync = sync_engine.get_last_sync(job.source, job.target)
-        responses.append(
-            SyncJobResponse(
-                id=job.id,
-                name=job.name,
-                source=job.source,
-                target=job.target,
-                status=job.status,
-                created_at=job.created_at,
-                updated_at=job.updated_at,
-                last_error=job.last_error,
-                last_synced_at=last_sync.last_synced_at if last_sync else None,
-                config=job.config,
-            )
+    # Persist progress back in engine store
+    if result.status == "completed":
+        sync_engine.mark_progress(
+            job_id,
+            status="completed",
+            processed_records=result.processed_records,
+            total_records=result.total_records,
+            inserted_records=result.inserted_records,
+            updated_records=result.updated_records,
+            completed_at=result.completed_at,
+            errors=result.errors,
+        )
+    else:
+        sync_engine.mark_progress(
+            job_id,
+            status="failed",
+            processed_records=result.processed_records,
+            total_records=result.total_records,
+            inserted_records=result.inserted_records,
+            updated_records=result.updated_records,
+            completed_at=result.completed_at,
+            errors=result.errors,
         )
 
-    return responses
+    progress = sync_engine.get_progress(job_id)
+    if not progress:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync job not found")
+
+    return _progress_from_engine(progress)
