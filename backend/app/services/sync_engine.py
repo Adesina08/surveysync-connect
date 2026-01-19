@@ -1,19 +1,74 @@
 from __future__ import annotations
 
+"""SQLite-backed storage for sync jobs + progress.
+
+The frontend expects the following API shapes:
+- POST /api/sync-jobs creates a job and returns a *progress* object.
+- GET  /api/sync-jobs returns a list of *progress* objects.
+- POST /api/sync-jobs/{id}/run updates progress, then returns progress.
+
+Those endpoints call the functions implemented in this module.
+"""
+
 import json
 from datetime import datetime, timezone
+from typing import Any
 
 from app.db.session import get_connection
 from app.models.last_sync import LastSyncMetadata
 from app.models.sync_job import SyncJob
 
 
-def create_sync_job(name: str, source: str, target: str, config: dict | None = None) -> SyncJob:
-    timestamp = datetime.now(tz=timezone.utc)
-    config_json = json.dumps(config or {})
+def _utcnow() -> datetime:
+    return datetime.now(tz=timezone.utc)
+
+
+def _safe_json_dumps(obj: Any, default: Any = None) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except TypeError:
+        return json.dumps(default if default is not None else {}, ensure_ascii=False)
+
+
+def _safe_json_loads(raw: str | None, default: Any) -> Any:
+    if not raw:
+        return default
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return default
+
+
+def _build_job_fields(config: dict[str, Any]) -> tuple[str, str, str]:
+    """Derive name/source/target fields from the frontend config."""
+    form_id = str(config.get("formId") or "").strip()
+    schema = str(config.get("targetSchema") or "").strip()
+    table = str(config.get("targetTable") or "").strip()
+
+    name = f"sync_{form_id}_to_{schema}.{table}".strip()
+    if len(name) > 200:
+        name = name[:200]
+
+    source = f"surveycto:{form_id}"
+    target = f"postgres:{schema}.{table}"
+    return name, source, target
+
+
+# -----------------------------------------------------------------------------
+# Sync Jobs
+# -----------------------------------------------------------------------------
+
+
+def create_sync_job(config: dict[str, Any]) -> int:
+    """Create a new sync job and a corresponding progress row.
+
+    Returns the created job id.
+    """
+    timestamp = _utcnow()
+    name, source, target = _build_job_fields(config)
 
     with get_connection() as connection:
-        cursor = connection.execute(
+        cur = connection.execute(
             """
             INSERT INTO sync_jobs (name, source, target, status, created_at, updated_at, last_error, config_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -26,40 +81,36 @@ def create_sync_job(name: str, source: str, target: str, config: dict | None = N
                 timestamp.isoformat(),
                 timestamp.isoformat(),
                 None,
-                config_json,
+                _safe_json_dumps(config, default={}),
             ),
         )
-        connection.commit()
-        job_id = cursor.lastrowid
+        job_id = int(cur.lastrowid)
 
-    return SyncJob(
-        id=job_id,
-        name=name,
-        source=source,
-        target=target,
-        status="queued",
-        created_at=timestamp,
-        updated_at=timestamp,
-        last_error=None,
-        config=config or {},
-    )
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO sync_progress
+              (job_id, status, processed_records, total_records, inserted_records, updated_records, errors_json, started_at, completed_at)
+            VALUES
+              (?, ?, 0, 0, 0, 0, '[]', NULL, NULL)
+            """,
+            (job_id, "pending"),
+        )
+        connection.commit()
+
+    return job_id
 
 
 def list_sync_jobs() -> list[SyncJob]:
     with get_connection() as connection:
         rows = connection.execute(
-            "SELECT id, name, source, target, status, created_at, updated_at, last_error, config_json FROM sync_jobs"
+            "SELECT id, name, source, target, status, created_at, updated_at, last_error, config_json FROM sync_jobs ORDER BY id DESC"
         ).fetchall()
 
     jobs: list[SyncJob] = []
     for row in rows:
-        try:
-            cfg = json.loads(row["config_json"] or "{}")
-        except Exception:
-            cfg = {}
         jobs.append(
             SyncJob(
-                id=row["id"],
+                id=int(row["id"]),
                 name=row["name"],
                 source=row["source"],
                 target=row["target"],
@@ -67,226 +118,148 @@ def list_sync_jobs() -> list[SyncJob]:
                 created_at=datetime.fromisoformat(row["created_at"]),
                 updated_at=datetime.fromisoformat(row["updated_at"]),
                 last_error=row["last_error"],
-                config=cfg,
+                config=_safe_json_loads(row["config_json"], default={}),
             )
         )
     return jobs
 
 
-def record_sync_completion(job_id: int, status: str, last_error: str | None = None) -> None:
-    timestamp = datetime.now(tz=timezone.utc)
-    with get_connection() as connection:
-        connection.execute(
-            """
-            UPDATE sync_jobs
-            SET status = ?, updated_at = ?, last_error = ?
-            WHERE id = ?
-            """,
-            (status, timestamp.isoformat(), last_error, job_id),
-        )
-        connection.commit()
+# -----------------------------------------------------------------------------
+# Progress
+# -----------------------------------------------------------------------------
 
 
-def _default_progress(job_id: int) -> dict:
+def _progress_row_to_dict(row) -> dict[str, Any]:
     return {
-        "jobId": job_id,
-        "status": "pending",
-        "processedRecords": 0,
-        "totalRecords": 0,
-        "insertedRecords": 0,
-        "updatedRecords": 0,
-        "errors": [],
-        "startedAt": None,
-        "completedAt": None,
-    }
-
-
-def _row_to_progress(row) -> dict:
-    try:
-        errors = json.loads(row["errors_json"] or "[]")
-    except Exception:
-        errors = []
-    return {
-        "jobId": row["job_id"],
+        "jobId": str(row["job_id"]),
         "status": row["status"],
-        "processedRecords": row["processed_records"] or 0,
-        "totalRecords": row["total_records"] or 0,
-        "insertedRecords": row["inserted_records"] or 0,
-        "updatedRecords": row["updated_records"] or 0,
-        "errors": errors,
+        "processedRecords": int(row["processed_records"] or 0),
+        "totalRecords": int(row["total_records"] or 0),
+        "insertedRecords": int(row["inserted_records"] or 0),
+        "updatedRecords": int(row["updated_records"] or 0),
+        "errors": _safe_json_loads(row["errors_json"], default=[]),
         "startedAt": row["started_at"],
         "completedAt": row["completed_at"],
     }
 
 
-def set_progress_running(job_id: int) -> dict:
-    timestamp = datetime.now(tz=timezone.utc).isoformat()
+def list_sync_jobs_progress() -> list[dict[str, Any]]:
+    """Return all job progress in the exact camelCase keys the UI expects."""
     with get_connection() as connection:
-        connection.execute(
+        rows = connection.execute(
             """
-            INSERT INTO sync_progress (
-                job_id,
-                status,
-                processed_records,
-                total_records,
-                inserted_records,
-                updated_records,
-                errors_json,
-                started_at,
-                completed_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(job_id) DO UPDATE SET
-                status = excluded.status,
-                processed_records = excluded.processed_records,
-                total_records = excluded.total_records,
-                inserted_records = excluded.inserted_records,
-                updated_records = excluded.updated_records,
-                errors_json = excluded.errors_json,
-                started_at = excluded.started_at,
-                completed_at = excluded.completed_at
-            """,
-            (
-                job_id,
-                "running",
-                0,
-                0,
-                0,
-                0,
-                json.dumps([]),
-                timestamp,
-                None,
-            ),
-        )
-        connection.commit()
-    record_sync_completion(job_id, "running", None)
-    return get_progress(job_id) or _default_progress(job_id)
+            SELECT
+              p.job_id, p.status, p.processed_records, p.total_records,
+              p.inserted_records, p.updated_records, p.errors_json,
+              p.started_at, p.completed_at
+            FROM sync_progress p
+            ORDER BY p.job_id DESC
+            """
+        ).fetchall()
+
+    return [_progress_row_to_dict(r) for r in rows]
 
 
-def get_progress(job_id: int) -> dict | None:
+def get_progress(job_id: int) -> dict[str, Any] | None:
     with get_connection() as connection:
         row = connection.execute(
             """
-            SELECT job_id, status, processed_records, total_records, inserted_records, updated_records,
-                   errors_json, started_at, completed_at
+            SELECT
+              job_id, status, processed_records, total_records,
+              inserted_records, updated_records, errors_json,
+              started_at, completed_at
             FROM sync_progress
             WHERE job_id = ?
             """,
             (job_id,),
         ).fetchone()
+
     if not row:
         return None
-    return _row_to_progress(row)
+    return _progress_row_to_dict(row)
 
 
-def list_progress() -> list[dict]:
-    with get_connection() as connection:
-        rows = connection.execute(
-            """
-            SELECT job_id, status, processed_records, total_records, inserted_records, updated_records,
-                   errors_json, started_at, completed_at
-            FROM sync_progress
-            ORDER BY job_id DESC
-            """
-        ).fetchall()
-    return [_row_to_progress(row) for row in rows]
-
-
-def update_progress(
+def mark_progress(
     job_id: int,
     *,
     status: str | None = None,
-    processedRecords: int | None = None,
-    totalRecords: int | None = None,
-    insertedRecords: int | None = None,
-    updatedRecords: int | None = None,
-    errors: list[dict] | None = None,
-    startedAt: str | None = None,
-    completedAt: str | None = None,
-) -> dict:
-    existing = get_progress(job_id) or _default_progress(job_id)
-    payload = {
-        "status": status or existing["status"],
-        "processed_records": processedRecords if processedRecords is not None else existing["processedRecords"],
-        "total_records": totalRecords if totalRecords is not None else existing["totalRecords"],
-        "inserted_records": insertedRecords if insertedRecords is not None else existing["insertedRecords"],
-        "updated_records": updatedRecords if updatedRecords is not None else existing["updatedRecords"],
-        "errors_json": json.dumps(errors if errors is not None else existing["errors"]),
-        "started_at": startedAt if startedAt is not None else existing["startedAt"],
-        "completed_at": completedAt if completedAt is not None else existing["completedAt"],
-    }
-
+    processed_records: int | None = None,
+    total_records: int | None = None,
+    inserted_records: int | None = None,
+    updated_records: int | None = None,
+    errors: list[dict[str, Any]] | None = None,
+    started_at: datetime | None = None,
+    completed_at: datetime | None = None,
+) -> None:
+    """Update progress fields safely (partial updates allowed)."""
     with get_connection() as connection:
+        current = connection.execute(
+            "SELECT * FROM sync_progress WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+
+        if not current:
+            # Create if missing (defensive)
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO sync_progress
+                  (job_id, status, processed_records, total_records, inserted_records, updated_records, errors_json, started_at, completed_at)
+                VALUES
+                  (?, ?, 0, 0, 0, 0, '[]', NULL, NULL)
+                """,
+                (job_id, status or "pending"),
+            )
+            connection.commit()
+            return
+
+        new_status = status or current["status"]
+        new_processed = int(processed_records) if processed_records is not None else int(current["processed_records"] or 0)
+        new_total = int(total_records) if total_records is not None else int(current["total_records"] or 0)
+        new_inserted = int(inserted_records) if inserted_records is not None else int(current["inserted_records"] or 0)
+        new_updated = int(updated_records) if updated_records is not None else int(current["updated_records"] or 0)
+
+        new_errors = errors if errors is not None else _safe_json_loads(current["errors_json"], default=[])
+
+        # Important: UI date formatting crashes if it receives undefined.
+        # We always store either NULL or an ISO string.
+        new_started_at = (
+            started_at.isoformat() if started_at is not None else current["started_at"]
+        )
+        new_completed_at = (
+            completed_at.isoformat() if completed_at is not None else current["completed_at"]
+        )
+
         connection.execute(
             """
-            INSERT INTO sync_progress (
-                job_id,
-                status,
-                processed_records,
-                total_records,
-                inserted_records,
-                updated_records,
-                errors_json,
-                started_at,
-                completed_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(job_id) DO UPDATE SET
-                status = excluded.status,
-                processed_records = excluded.processed_records,
-                total_records = excluded.total_records,
-                inserted_records = excluded.inserted_records,
-                updated_records = excluded.updated_records,
-                errors_json = excluded.errors_json,
-                started_at = excluded.started_at,
-                completed_at = excluded.completed_at
+            UPDATE sync_progress
+            SET status = ?, processed_records = ?, total_records = ?, inserted_records = ?, updated_records = ?,
+                errors_json = ?, started_at = ?, completed_at = ?
+            WHERE job_id = ?
             """,
             (
+                new_status,
+                new_processed,
+                new_total,
+                new_inserted,
+                new_updated,
+                _safe_json_dumps(new_errors, default=[]),
+                new_started_at,
+                new_completed_at,
                 job_id,
-                payload["status"],
-                payload["processed_records"],
-                payload["total_records"],
-                payload["inserted_records"],
-                payload["updated_records"],
-                payload["errors_json"],
-                payload["started_at"],
-                payload["completed_at"],
             ),
         )
+
+        # Keep sync_jobs.status roughly aligned for admin/debugging
+        connection.execute(
+            "UPDATE sync_jobs SET status = ?, updated_at = ? WHERE id = ?",
+            (new_status, _utcnow().isoformat(), job_id),
+        )
         connection.commit()
-    if status == "completed":
-        record_sync_completion(job_id, status, None)
-    return get_progress(job_id) or _default_progress(job_id)
 
 
-def finish_success(job_id: int, *, inserted: int = 0, updated: int = 0) -> dict:
-    timestamp = datetime.now(tz=timezone.utc).isoformat()
-    return update_progress(
-        job_id,
-        status="completed",
-        insertedRecords=inserted,
-        updatedRecords=updated,
-        completedAt=timestamp,
-    )
-
-
-def finish_failed(job_id: int, error_message: str) -> dict:
-    timestamp = datetime.now(tz=timezone.utc).isoformat()
-    progress = get_progress(job_id) or _default_progress(job_id)
-    errors = list(progress["errors"])
-    errors.append(
-        {
-            "recordId": "n/a",
-            "message": error_message,
-        }
-    )
-    record_sync_completion(job_id, "failed", error_message)
-    return update_progress(
-        job_id,
-        status="failed",
-        errors=errors,
-        completedAt=timestamp,
-    )
+# -----------------------------------------------------------------------------
+# Last Sync
+# -----------------------------------------------------------------------------
 
 
 def upsert_last_sync(source: str, target: str, last_synced_at: datetime) -> LastSyncMetadata:
@@ -306,7 +279,7 @@ def upsert_last_sync(source: str, target: str, last_synced_at: datetime) -> Last
         ).fetchone()
 
     return LastSyncMetadata(
-        id=row["id"],
+        id=int(row["id"]),
         source=row["source"],
         target=row["target"],
         last_synced_at=datetime.fromisoformat(row["last_synced_at"]),
@@ -322,7 +295,7 @@ def get_last_sync(source: str, target: str) -> LastSyncMetadata | None:
     if not row:
         return None
     return LastSyncMetadata(
-        id=row["id"],
+        id=int(row["id"]),
         source=row["source"],
         target=row["target"],
         last_synced_at=datetime.fromisoformat(row["last_synced_at"]),
