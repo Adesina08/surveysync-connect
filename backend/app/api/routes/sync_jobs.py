@@ -3,13 +3,39 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Path, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Path, status
 from pydantic import BaseModel, Field
 
 from app.services import sync_engine, sync_runner
 
 
 router = APIRouter(prefix="/api/sync-jobs", tags=["sync-jobs"])
+
+
+def _run_and_persist(job_id: int) -> None:
+    """Run a sync job and persist its final progress.
+
+    This is meant to be executed as a FastAPI BackgroundTask so the POST request
+    can return quickly and the UI can poll GET /api/sync-jobs/{id}.
+    """
+    result = sync_runner.run_sync_job(job_id)
+
+    # Persist progress back in engine store
+    sync_engine.mark_progress(
+        job_id,
+        status="completed" if result.status == "completed" else "failed",
+        processed_records=result.processed_records,
+        total_records=result.total_records,
+        inserted_records=result.inserted_records,
+        updated_records=result.updated_records,
+        completed_at=result.completed_at,
+        errors=result.errors,
+    )
+    sync_engine.record_sync_completion(
+        job_id,
+        "completed" if result.status == "completed" else "failed",
+        None if result.status == "completed" else (result.errors[-1]["message"] if result.errors else "failed"),
+    )
 
 
 # -------------------------
@@ -77,8 +103,30 @@ def list_sync_jobs() -> list[SyncProgress]:
     return [_progress_from_engine(j) for j in jobs]
 
 
+@router.delete("/completed")
+def clear_completed_jobs() -> dict[str, int]:
+    count = sync_engine.clear_completed_jobs()
+    return {"deleted": count}
+
+
+@router.get("/{job_id}", response_model=SyncProgress)
+def get_sync_job(job_id: int = Path(..., ge=1)) -> SyncProgress:
+    progress = sync_engine.get_progress(job_id)
+    if not progress:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync job not found")
+    return _progress_from_engine(progress)
+
+
+@router.delete("/{job_id}")
+def delete_sync_job(job_id: int = Path(..., ge=1)) -> dict[str, str]:
+    deleted = sync_engine.delete_sync_job(job_id)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync job not found")
+    return {"status": "ok"}
+
+
 @router.post("", response_model=SyncProgress)
-def create_sync_job(config: SyncJobConfig) -> SyncProgress:
+def create_sync_job(config: SyncJobConfig, background_tasks: BackgroundTasks) -> SyncProgress:
     if config.syncMode == "upsert" and not config.primaryKeyField:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -86,6 +134,14 @@ def create_sync_job(config: SyncJobConfig) -> SyncProgress:
         )
 
     job_id = sync_engine.create_sync_job(config.model_dump())
+
+    # Mark running and start in the background so the UI can poll.
+    sync_engine.mark_progress(
+        job_id,
+        status="running",
+        started_at=datetime.now(tz=timezone.utc),
+    )
+    background_tasks.add_task(_run_and_persist, job_id)
 
     progress = sync_engine.get_progress(job_id)
     if not progress:
