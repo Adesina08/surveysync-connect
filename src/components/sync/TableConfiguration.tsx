@@ -12,7 +12,7 @@ import {
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { useSyncContext } from "@/contexts/SyncContext";
-import { getSchemas, getTables } from "@/api/postgres";
+import { fetchSchemas, fetchTables } from "@/api/postgres";
 import { CheckCircle2, AlertTriangle, Table, Plus } from "lucide-react";
 
 function safeNumber(value: unknown, fallback = 0): number {
@@ -32,7 +32,7 @@ const TableConfiguration = ({ onNext, onBack }: { onNext: () => void; onBack: ()
     (async () => {
       setLoading(true);
       try {
-        const loaded = await getSchemas();
+        const loaded = await fetchSchemas();
         setSchemas(loaded);
       } finally {
         setLoading(false);
@@ -43,7 +43,7 @@ const TableConfiguration = ({ onNext, onBack }: { onNext: () => void; onBack: ()
   useEffect(() => {
     (async () => {
       if (!selectedSchema) return;
-      const loadedTables = await getTables(selectedSchema);
+      const loadedTables = await fetchTables(selectedSchema);
       setTables(loadedTables);
     })();
   }, [selectedSchema]);
