@@ -20,7 +20,12 @@ function safeNumber(value: unknown, fallback = 0): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
-const TableConfiguration = ({ onNext, onBack }: { onNext: () => void; onBack: () => void }) => {
+type Props = {
+  onContinue: () => void;
+  onBack: () => void;
+};
+
+const TableConfiguration = ({ onContinue, onBack }: Props) => {
   const { state, setSelectedSchema, setSelectedTable, setCreateNewTable, setNewTableName } = useSyncContext();
   const { selectedSchema, selectedTable, createNewTable, newTableName, selectedForm } = state;
 
@@ -60,6 +65,7 @@ const TableConfiguration = ({ onNext, onBack }: { onNext: () => void; onBack: ()
           <CardTitle className="text-lg">Target Table Setup</CardTitle>
           <CardDescription>Select an existing table or create a new one</CardDescription>
         </CardHeader>
+
         <CardContent className="space-y-6">
           <div className="space-y-3">
             <Label className="text-sm font-medium">Schema</Label>
@@ -164,10 +170,10 @@ const TableConfiguration = ({ onNext, onBack }: { onNext: () => void; onBack: ()
           )}
 
           <div className="flex justify-between pt-2">
-            <Button variant="outline" onClick={onBack}>
+            <Button type="button" variant="outline" onClick={onBack}>
               Back
             </Button>
-            <Button variant="gradient" onClick={onNext} disabled={!canContinue}>
+            <Button type="button" variant="gradient" onClick={onContinue} disabled={!canContinue}>
               Continue
             </Button>
           </div>
