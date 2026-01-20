@@ -2,12 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable, Any
-from urllib.parse import urlparse, quote
-
+from typing import Iterable
+from urllib.parse import urlparse
 import xml.etree.ElementTree as ElementTree
+import json
+
 import httpx
 
+from app.db.session import get_connection
+
+
+# -------------------------
+# Models
+# -------------------------
 
 @dataclass
 class SessionInfo:
@@ -25,8 +32,9 @@ class SurveyCTOForm:
     version: str
 
 
-_SESSIONS: Dict[str, SessionInfo] = {}
-
+# -------------------------
+# Errors
+# -------------------------
 
 class SurveyCTOServiceError(Exception):
     pass
@@ -58,19 +66,93 @@ class SubmissionsFetchError(SurveyCTOServiceError):
     pass
 
 
+# -------------------------
+# SQLite session persistence
+# -------------------------
+
+def _ensure_sessions_table() -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS surveycto_sessions (
+                token TEXT PRIMARY KEY,
+                expires_at TEXT NOT NULL,
+                username TEXT NOT NULL,
+                password TEXT NOT NULL,
+                server_url TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def _save_session(session: SessionInfo) -> None:
+    _ensure_sessions_table()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO surveycto_sessions
+                (token, expires_at, username, password, server_url, created_at)
+            VALUES
+                (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session.token,
+                session.expires_at.isoformat(),
+                session.username,
+                session.password,
+                session.server_url,
+                datetime.now(tz=timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+
+
+def _load_session(token: str) -> SessionInfo | None:
+    _ensure_sessions_table()
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT token, expires_at, username, password, server_url
+            FROM surveycto_sessions
+            WHERE token = ?
+            """,
+            (token,),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    expires_at = datetime.fromisoformat(row["expires_at"])
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+    return SessionInfo(
+        token=row["token"],
+        expires_at=expires_at,
+        username=row["username"],
+        password=row["password"],
+        server_url=row["server_url"],
+    )
+
+
+def _delete_session(token: str) -> None:
+    _ensure_sessions_table()
+    with get_connection() as conn:
+        conn.execute("DELETE FROM surveycto_sessions WHERE token = ?", (token,))
+        conn.commit()
+
+
+# -------------------------
+# Helpers
+# -------------------------
+
 def _normalize_server_url(server_url: str) -> str:
     parsed = urlparse(server_url)
     if not parsed.scheme:
         return f"https://{server_url.strip('/')}"
     return server_url.rstrip("/")
-
-
-def _epoch_seconds(dt: datetime | None) -> int:
-    if dt is None:
-        return 0
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.astimezone(timezone.utc).timestamp())
 
 
 def _parse_form_list(xml_payload: str) -> list[SurveyCTOForm]:
@@ -103,10 +185,22 @@ def _parse_form_list(xml_payload: str) -> list[SurveyCTOForm]:
     return forms
 
 
+def _datetime_to_epoch_seconds(dt: datetime | None) -> int:
+    if dt is None:
+        return 0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.astimezone(timezone.utc).timestamp())
+
+
+# -------------------------
+# Public API used by routes / sync
+# -------------------------
+
 def create_session(username: str, password: str, server_url: str) -> SessionInfo:
     normalized_url = _normalize_server_url(server_url)
     token = f"session_{username}_{int(datetime.now(tz=timezone.utc).timestamp())}"
-    expires_at = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+    expires_at = datetime.now(tz=timezone.utc) + timedelta(hours=6)
 
     session = SessionInfo(
         token=token,
@@ -115,24 +209,32 @@ def create_session(username: str, password: str, server_url: str) -> SessionInfo
         password=password,
         server_url=normalized_url,
     )
-    _SESSIONS[token] = session
+
+    _save_session(session)
     return session
 
 
 def get_session(session_token: str) -> SessionInfo:
-    session = _SESSIONS.get(session_token)
+    session = _load_session(session_token)
     if not session:
         raise InvalidSessionError("Session token is invalid or expired.")
-    if session.expires_at <= datetime.now(tz=timezone.utc):
-        _SESSIONS.pop(session_token, None)
-        raise InvalidSessionError("Session token is expired.")
+
+    now = datetime.now(tz=timezone.utc)
+    if session.expires_at < now:
+        _delete_session(session_token)
+        raise InvalidSessionError("Session token is invalid or expired.")
+
     return session
 
 
+# -------------------------
+# SurveyCTO HTTP calls
+# -------------------------
+
 async def _fetch_form_list(session: SessionInfo) -> str:
     """
-    OpenRosa endpoint /formList.
-    Sometimes returns HTML/login page with 200; we guard against non-XML.
+    OpenRosa endpoint /formList (has titles).
+    Can return HTML/login pages with 200; guard against non-XML.
     """
     form_list_url = f"{session.server_url}/formList"
     headers = {
@@ -154,18 +256,21 @@ async def _fetch_form_list(session: SessionInfo) -> str:
     if response.status_code in {401, 403}:
         raise AuthenticationError("SurveyCTO credentials are invalid or access is denied.")
     if response.status_code == 404:
-        raise ApiAccessError("SurveyCTO /formList endpoint was not found on this server.", 404)
+        raise ApiAccessError("SurveyCTO form list endpoint was not found on this server.", status_code=404)
     if response.status_code >= 400:
-        raise ApiAccessError(f"SurveyCTO /formList request failed with status {response.status_code}.", response.status_code)
+        raise ApiAccessError(
+            f"SurveyCTO form list request failed with status {response.status_code}.",
+            status_code=response.status_code,
+        )
 
     content_type = (response.headers.get("content-type") or "").lower()
     body = response.text or ""
 
-    # Stronger guard: HTML pages often start with "<!DOCTYPE html" or "<html"
-    if "xml" not in content_type:
-        lowered = body.lstrip().lower()
-        if lowered.startswith("<!doctype html") or lowered.startswith("<html"):
-            raise FormListParseError("SurveyCTO /formList returned HTML instead of XML (likely a login/proxy page).")
+    if ("xml" not in content_type) and (not body.lstrip().startswith("<")):
+        raise FormListParseError(
+            f"SurveyCTO /formList did not return XML. content-type={content_type!r} "
+            f"snippet={(body[:300])!r}"
+        )
 
     return body
 
@@ -173,13 +278,10 @@ async def _fetch_form_list(session: SessionInfo) -> str:
 async def _fetch_form_ids(session: SessionInfo) -> Iterable[str]:
     """
     SurveyCTO Server API v2 endpoint: /api/v2/forms/ids
-    Some servers may not have it; some return HTML.
+    Often blocked / returns HTML; we guard and show snippet.
     """
     url = f"{session.server_url}/api/v2/forms/ids"
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "SurveySync Connect",
-    }
+    headers = {"Accept": "application/json", "User-Agent": "SurveySync Connect"}
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(20.0), follow_redirects=True) as client:
@@ -190,29 +292,36 @@ async def _fetch_form_ids(session: SessionInfo) -> Iterable[str]:
     if response.status_code in {401, 403}:
         raise AuthenticationError("SurveyCTO credentials are invalid or access is denied.")
     if response.status_code == 404:
-        raise ApiAccessError("SurveyCTO forms ids endpoint was not found on this server.", 404)
+        raise ApiAccessError("SurveyCTO forms ids endpoint was not found on this server.", status_code=404)
     if response.status_code >= 400:
-        raise ApiAccessError(f"SurveyCTO forms ids request failed with status {response.status_code}.", response.status_code)
+        raise ApiAccessError(
+            f"SurveyCTO forms ids request failed with status {response.status_code}.",
+            status_code=response.status_code,
+        )
 
-    # If we got HTML, treat it like "not available" so caller can fallback
     content_type = (response.headers.get("content-type") or "").lower()
-    text = response.text or ""
+    raw = response.text or ""
+
+    # Must be JSON; if not, show snippet (this is your current failing case)
     if "json" not in content_type:
-        lowered = text.lstrip().lower()
-        if lowered.startswith("<!doctype html") or lowered.startswith("<html") or lowered.startswith("<"):
-            raise ApiAccessError("SurveyCTO forms ids did not return JSON (likely not supported).", 404)
+        raise FormListParseError(
+            f"SurveyCTO forms ids did not return JSON. content-type={content_type!r} snippet={(raw[:300])!r}"
+        )
 
     try:
         payload = response.json()
     except ValueError as exc:
-        snippet = text[:300]
-        raise FormListParseError(f"Unable to parse SurveyCTO form ids response (invalid JSON). snippet={snippet!r}") from exc
+        raise FormListParseError(
+            f"SurveyCTO forms ids returned invalid JSON. content-type={content_type!r} snippet={(raw[:300])!r}"
+        ) from exc
 
     if isinstance(payload, dict):
         form_ids = payload.get("formIds")
         if isinstance(form_ids, list):
             return [str(x).strip() for x in form_ids if str(x).strip()]
-        raise FormListParseError("Unable to parse SurveyCTO form ids response: missing 'formIds' list.")
+
+        err = payload.get("error") or payload
+        raise FormListParseError(f"SurveyCTO forms ids JSON missing formIds. payload={err}")
 
     if isinstance(payload, list):
         return [str(x).strip() for x in payload if str(x).strip()]
@@ -222,12 +331,11 @@ async def _fetch_form_ids(session: SessionInfo) -> Iterable[str]:
 
 async def list_forms(session_token: str) -> list[SurveyCTOForm]:
     """
-    Prefer /formList (has titles).
-    Fall back to /api/v2/forms/ids (IDs only).
+    Prefer /formList (titles). Fall back to /api/v2/forms/ids (IDs only).
     """
     session = get_session(session_token)
 
-    # 1) Prefer OpenRosa /formList for titles
+    # 1) Prefer /formList (titles)
     try:
         xml_payload = await _fetch_form_list(session)
         forms = _parse_form_list(xml_payload)
@@ -236,7 +344,7 @@ async def list_forms(session_token: str) -> list[SurveyCTOForm]:
     except (FormListParseError, ApiAccessError):
         pass
 
-    # 2) Fallback to v2 (IDs only)
+    # 2) Fallback ids
     form_ids = await _fetch_form_ids(session)
     return [SurveyCTOForm(form_id=fid, title=fid, version="") for fid in form_ids]
 
@@ -245,62 +353,60 @@ async def fetch_submissions_wide_json(
     session_token: str,
     form_id: str,
     since_dt: datetime | None,
-) -> list[dict[str, Any]]:
+) -> list[dict]:
     """
-    Fetch submissions for a form using:
+    Fetch SurveyCTO wide JSON submissions:
       /api/v2/forms/data/wide/json/{FORM_ID}?date={epoch_seconds}
-
-    Handles SurveyCTO constraints:
-    - If full pull is blocked (412/417), automatically retries with a safer window (last 30 days).
     """
     session = get_session(session_token)
+    date_param = _datetime_to_epoch_seconds(since_dt)
 
-    # Try incremental first (or 0 for first run)
-    date_param = _epoch_seconds(since_dt)
-
-    async def _do_request(date_value: int) -> httpx.Response:
-        safe_form_id = quote(form_id, safe="")
-        url = f"{session.server_url}/api/v2/forms/data/wide/json/{safe_form_id}?date={date_value}"
-        headers = {"Accept": "application/json", "User-Agent": "SurveySync Connect"}
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0), follow_redirects=True) as client:
-            return await client.get(url, auth=(session.username, session.password), headers=headers)
+    url = f"{session.server_url}/api/v2/forms/data/wide/json/{form_id}?date={date_param}"
 
     try:
-        resp = await _do_request(date_param)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0), follow_redirects=True) as client:
+            resp = await client.get(url, auth=(session.username, session.password))
     except httpx.RequestError as exc:
-        raise ServerConnectionError("Unable to reach the SurveyCTO server.") from exc
+        raise SubmissionsFetchError("Unable to reach the SurveyCTO server for submissions.") from exc
 
     if resp.status_code in {401, 403}:
         raise AuthenticationError("SurveyCTO credentials are invalid or access is denied.")
 
-    # If full pull blocked / precondition issues, retry last 30 days
+    # SurveyCTO may return 412/417 depending on server/API constraints.
     if resp.status_code in {412, 417}:
-        fallback_dt = datetime.now(tz=timezone.utc) - timedelta(days=30)
-        fallback_epoch = _epoch_seconds(fallback_dt)
-        try:
-            resp = await _do_request(fallback_epoch)
-        except httpx.RequestError as exc:
-            raise ServerConnectionError("Unable to reach the SurveyCTO server.") from exc
+        snippet = (resp.text or "")[:400]
+        raise SubmissionsFetchError(
+            f"SurveyCTO submissions request failed with status {resp.status_code}. snippet={snippet!r}"
+        )
 
     if resp.status_code >= 400:
-        snippet = (resp.text or "")[:500]
-        raise SubmissionsFetchError(f"SurveyCTO submissions request failed with status {resp.status_code}. {snippet}")
+        snippet = (resp.text or "")[:400]
+        raise SubmissionsFetchError(
+            f"SurveyCTO submissions request failed with status {resp.status_code}. snippet={snippet!r}"
+        )
 
-    # Validate JSON
+    # Guard JSON
+    ctype = (resp.headers.get("content-type") or "").lower()
+    if "json" not in ctype:
+        snippet = (resp.text or "")[:400]
+        raise SubmissionsFetchError(
+            f"SurveyCTO submissions did not return JSON. content-type={ctype!r} snippet={snippet!r}"
+        )
+
     try:
         payload = resp.json()
     except ValueError as exc:
-        snippet = (resp.text or "")[:500]
-        raise SubmissionsFetchError(f"SurveyCTO submissions returned invalid JSON. snippet={snippet!r}") from exc
+        snippet = (resp.text or "")[:400]
+        raise SubmissionsFetchError(f"SurveyCTO submissions invalid JSON. snippet={snippet!r}") from exc
 
-    # SurveyCTO returns a list of rows for wide/json
-    if isinstance(payload, list):
-        return [r for r in payload if isinstance(r, dict)]
+    if not isinstance(payload, list):
+        raise SubmissionsFetchError(f"SurveyCTO submissions unexpected JSON type: {type(payload).__name__}")
 
-    # Some proxies wrap data
-    if isinstance(payload, dict):
-        data = payload.get("data")
-        if isinstance(data, list):
-            return [r for r in data if isinstance(r, dict)]
-
-    raise SubmissionsFetchError("SurveyCTO submissions response format is unexpected.")
+    # ensure dict rows
+    rows: list[dict] = []
+    for item in payload:
+        if isinstance(item, dict):
+            rows.append(item)
+        else:
+            rows.append({"_value": item})
+    return rows
