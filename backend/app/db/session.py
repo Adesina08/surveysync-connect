@@ -67,4 +67,15 @@ def init_db() -> None:
             )
             """
         )
+
+        # SurveyCTO API cooldowns (HTTP 417 asks clients to wait before retrying)
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS surveycto_cooldowns (
+                source TEXT PRIMARY KEY,
+                cooldown_until TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         connection.commit()
