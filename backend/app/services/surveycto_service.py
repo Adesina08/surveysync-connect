@@ -6,6 +6,8 @@ from typing import Iterable
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ElementTree
 import json
+import re
+import asyncio
 
 import httpx
 
@@ -193,6 +195,70 @@ def _datetime_to_epoch_seconds(dt: datetime | None) -> int:
     return int(dt.astimezone(timezone.utc).timestamp())
 
 
+def _extract_retry_after_seconds(resp: httpx.Response) -> int | None:
+    """
+    SurveyCTO sometimes returns:
+      {"error":{"code":417,"message":"Please wait for 106 seconds before retrying ..."}}
+
+    Extracts the 106.
+    """
+    # Prefer JSON message if possible
+    text = resp.text or ""
+    try:
+        payload = resp.json()
+        if isinstance(payload, dict):
+            err = payload.get("error")
+            if isinstance(err, dict):
+                msg = str(err.get("message") or "")
+                m = re.search(r"wait for\s+(\d+)\s+seconds", msg, flags=re.IGNORECASE)
+                if m:
+                    return int(m.group(1))
+    except Exception:
+        pass
+
+    # Fallback to raw text
+    m = re.search(r"wait for\s+(\d+)\s+seconds", text, flags=re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+
+    return None
+
+
+async def _get_with_417_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    auth: tuple[str, str],
+    headers: dict | None = None,
+    max_retries: int = 3,
+) -> httpx.Response:
+    """
+    Retries SurveyCTO "cooldown" 417 responses by sleeping the required time.
+
+    Why: SurveyCTO returns 417 with "Please wait for X seconds..." when you hit
+    the submissions endpoint too frequently.
+    """
+    attempt = 0
+    while True:
+        resp = await client.get(url, auth=auth, headers=headers)
+
+        if resp.status_code != 417:
+            return resp
+
+        attempt += 1
+        wait_s = _extract_retry_after_seconds(resp) or 60
+
+        if attempt > max_retries:
+            snippet = (resp.text or "")[:400]
+            raise SubmissionsFetchError(
+                f"SurveyCTO submissions request failed with status 417 after retries. "
+                f"last_wait={wait_s}s snippet={snippet!r}"
+            )
+
+        # Small buffer so we don't hit the exact boundary
+        await asyncio.sleep(wait_s + 2)
+
+
 # -------------------------
 # Public API used by routes / sync
 # -------------------------
@@ -357,6 +423,8 @@ async def fetch_submissions_wide_json(
     """
     Fetch SurveyCTO wide JSON submissions:
       /api/v2/forms/data/wide/json/{FORM_ID}?date={epoch_seconds}
+
+    Handles SurveyCTO 417 "cooldown" by waiting and retrying automatically.
     """
     session = get_session(session_token)
     date_param = _datetime_to_epoch_seconds(since_dt)
@@ -365,15 +433,21 @@ async def fetch_submissions_wide_json(
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(60.0), follow_redirects=True) as client:
-            resp = await client.get(url, auth=(session.username, session.password))
+            resp = await _get_with_417_retry(
+                client,
+                url,
+                auth=(session.username, session.password),
+                headers={"User-Agent": "SurveySync Connect", "Accept": "application/json"},
+                max_retries=3,
+            )
     except httpx.RequestError as exc:
         raise SubmissionsFetchError("Unable to reach the SurveyCTO server for submissions.") from exc
 
     if resp.status_code in {401, 403}:
         raise AuthenticationError("SurveyCTO credentials are invalid or access is denied.")
 
-    # SurveyCTO may return 412/417 depending on server/API constraints.
-    if resp.status_code in {412, 417}:
+    # Still treat 412 as a hard error (usually constraints / API requirements)
+    if resp.status_code == 412:
         snippet = (resp.text or "")[:400]
         raise SubmissionsFetchError(
             f"SurveyCTO submissions request failed with status {resp.status_code}. snippet={snippet!r}"
