@@ -17,25 +17,44 @@ def _run_and_persist(job_id: int) -> None:
 
     This is meant to be executed as a FastAPI BackgroundTask so the POST request
     can return quickly and the UI can poll GET /api/sync-jobs/{id}.
-    """
-    result = sync_runner.run_sync_job(job_id)
 
-    # Persist progress back in engine store
-    sync_engine.mark_progress(
-        job_id,
-        status="completed" if result.status == "completed" else "failed",
-        processed_records=result.processed_records,
-        total_records=result.total_records,
-        inserted_records=result.inserted_records,
-        updated_records=result.updated_records,
-        completed_at=result.completed_at,
-        errors=result.errors,
-    )
-    sync_engine.record_sync_completion(
-        job_id,
-        "completed" if result.status == "completed" else "failed",
-        None if result.status == "completed" else (result.errors[-1]["message"] if result.errors else "failed"),
-    )
+    IMPORTANT: never allow an exception to escape this function, otherwise the
+    job may remain stuck in "running" and the UI will poll forever.
+    """
+    try:
+        result = sync_runner.run_sync_job(job_id)
+
+        # Persist progress back in engine store
+        sync_engine.mark_progress(
+            job_id,
+            status="completed" if result.status == "completed" else "failed",
+            processed_records=result.processed_records,
+            total_records=result.total_records,
+            inserted_records=result.inserted_records,
+            updated_records=result.updated_records,
+            completed_at=result.completed_at,
+            errors=result.errors,
+        )
+        sync_engine.record_sync_completion(
+            job_id,
+            "completed" if result.status == "completed" else "failed",
+            None if result.status == "completed" else (result.errors[-1]["message"] if result.errors else "failed"),
+        )
+
+    except Exception as exc:
+        # ✅ Never leave a job in "running" if the background task crashes
+        msg = f"Background task crashed: {exc}"
+        sync_engine.mark_progress(
+            job_id,
+            status="failed",
+            processed_records=0,
+            total_records=0,
+            inserted_records=0,
+            updated_records=0,
+            completed_at=datetime.now(tz=timezone.utc),
+            errors=[{"recordId": "backend", "field": None, "message": msg}],
+        )
+        sync_engine.record_sync_completion(job_id, "failed", msg)
 
 
 # -------------------------
@@ -173,6 +192,7 @@ def run_sync_job(job_id: int = Path(..., ge=1)) -> SyncProgress:
             completed_at=result.completed_at,
             errors=result.errors,
         )
+        sync_engine.record_sync_completion(job_id, "completed", None)
     else:
         sync_engine.mark_progress(
             job_id,
@@ -183,6 +203,11 @@ def run_sync_job(job_id: int = Path(..., ge=1)) -> SyncProgress:
             updated_records=result.updated_records,
             completed_at=result.completed_at,
             errors=result.errors,
+        )
+        sync_engine.record_sync_completion(
+            job_id,
+            "failed",
+            result.errors[-1]["message"] if result.errors else "failed",
         )
 
     progress = sync_engine.get_progress(job_id)
