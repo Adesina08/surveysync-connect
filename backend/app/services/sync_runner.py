@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+import random
+import time
+
 import psycopg2
 import psycopg2.extras as extras
 from psycopg2 import sql
@@ -22,6 +25,21 @@ class SyncRunResult:
     errors: list[dict[str, Any]]
     started_at: datetime
     completed_at: datetime
+
+
+def _is_transient_pg_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        "ssl syscall" in msg
+        or "server closed the connection" in msg
+        or "connection already closed" in msg
+        or "terminating connection" in msg
+        or "timeout expired" in msg
+        or "could not connect" in msg
+        or "connection reset by peer" in msg
+        or "broken pipe" in msg
+        or "eof detected" in msg
+    )
 
 
 def run_sync_job(job_id: int) -> SyncRunResult:
@@ -77,6 +95,7 @@ def run_sync_job(job_id: int) -> SyncRunResult:
     last_sync = sync_engine.get_last_sync(source, target)
     since_dt = last_sync.last_synced_at if last_sync else None
 
+    # 1) Fetch SurveyCTO FIRST (may wait/retry on 417 inside surveycto_service)
     try:
         rows = _run_async_fetch(session_token=session_token, form_id=form_id, since_dt=since_dt)
     except surveycto_service.SubmissionsFetchError as exc:
@@ -128,10 +147,20 @@ def run_sync_job(job_id: int) -> SyncRunResult:
 
     # For upsert, PK must exist in incoming data
     if sync_mode == "upsert" and pk not in col_names:
-        raise ValueError(f"primary key field '{pk}' not present in data columns")
-
-    inserted = 0
-    updated = 0
+        msg = f"primary key field '{pk}' not present in data columns"
+        errors.append({"recordId": "config", "field": None, "message": msg})
+        sync_engine.record_sync_completion(job_id, "failed", msg)
+        return SyncRunResult(
+            job_id=job_id,
+            status="failed",
+            processed_records=0,
+            total_records=total,
+            inserted_records=0,
+            updated_records=0,
+            errors=errors,
+            started_at=started_at,
+            completed_at=datetime.now(tz=timezone.utc),
+        )
 
     creds = postgres_session.get_credentials()
     if not creds:
@@ -151,70 +180,71 @@ def run_sync_job(job_id: int) -> SyncRunResult:
         )
 
     def _connect_pg():
-        return psycopg2.connect(
-            host=creds.host,
-            port=creds.port,
-            dbname=creds.database,
-            user=creds.username,
-            password=creds.password,
-            sslmode=creds.sslmode,
-            connect_timeout=10,
-            keepalives=1,
-            keepalives_idle=30,
-            keepalives_interval=10,
-            keepalives_count=5,
-            application_name="surveysync-connect",
-        )
+        """
+        Robust connect with retries to survive transient provider/network/pooler drops.
+        """
+        sslmode = getattr(creds, "sslmode", None) or "require"
+        last_exc: Exception | None = None
+
+        for attempt in range(1, 5):  # 4 attempts
+            try:
+                return psycopg2.connect(
+                    host=creds.host,
+                    port=creds.port,
+                    dbname=creds.database,
+                    user=creds.username,
+                    password=creds.password,
+                    sslmode=sslmode,
+                    connect_timeout=10,
+                    keepalives=1,
+                    keepalives_idle=30,
+                    keepalives_interval=10,
+                    keepalives_count=5,
+                    application_name="surveysync-connect",
+                )
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
+                last_exc = exc
+                if (not _is_transient_pg_error(exc)) or attempt == 4:
+                    raise
+                # exponential backoff + jitter
+                time.sleep((0.5 * (2 ** (attempt - 1))) + random.uniform(0, 0.25))
+
+        raise last_exc if last_exc else RuntimeError("Postgres connect failed")
 
     def _write_once() -> tuple[int, int]:
-        _inserted = 0
-        _updated = 0
-        conn = _connect_pg()
-        try:
-            conn.autocommit = False
-            with conn:
-                with conn.cursor() as cur:
-                    # ✅ Create schema/table + add missing columns
-                    _ensure_table_ready(cur, schema, table, col_names, sync_mode, pk)
-
-                    if sync_mode == "append":
-                        _inserted = _insert_append(cur, schema, table, col_names, rows)
-                    else:
-                        _inserted, _updated = _upsert(cur, schema, table, col_names, rows, pk)
-            return _inserted, _updated
-        finally:
+        """
+        Write with a fresh connection; retry once on transient TLS/socket drops.
+        """
+        for attempt in range(1, 3):  # 2 attempts
+            conn = _connect_pg()
             try:
-                conn.close()
-            except Exception:
-                pass
+                with conn:
+                    with conn.cursor() as cur:
+                        _ensure_table_ready(cur, schema, table, col_names, sync_mode, pk)
 
+                        if sync_mode == "append":
+                            ins = _insert_append(cur, schema, table, col_names, rows)
+                            return ins, 0
+                        else:
+                            return _upsert(cur, schema, table, col_names, rows, pk)
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
+                if (not _is_transient_pg_error(exc)) or attempt == 2:
+                    raise
+                time.sleep(1.0)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        raise RuntimeError("Unreachable")
+
+    inserted = 0
+    updated = 0
+
+    # 2) Write to Postgres (with connect + write retries)
     try:
         inserted, updated = _write_once()
-    except (psycopg2.InterfaceError, psycopg2.OperationalError) as exc:
-        msg = str(exc).lower()
-        can_retry = (
-            "connection already closed" in msg
-            or "server closed" in msg
-            or "terminating connection" in msg
-        )
-
-        # Retry only for upsert to avoid duplicates in append mode
-        if can_retry and sync_mode != "append":
-            inserted, updated = _write_once()
-        else:
-            errors.append({"recordId": "postgres", "field": None, "message": f"Postgres write failed: {exc}"})
-            sync_engine.record_sync_completion(job_id, "failed", str(exc))
-            return SyncRunResult(
-                job_id=job_id,
-                status="failed",
-                processed_records=0,
-                total_records=total,
-                inserted_records=inserted,
-                updated_records=updated,
-                errors=errors,
-                started_at=started_at,
-                completed_at=datetime.now(tz=timezone.utc),
-            )
     except Exception as exc:
         errors.append({"recordId": "postgres", "field": None, "message": f"Postgres write failed: {exc}"})
         sync_engine.record_sync_completion(job_id, "failed", str(exc))
@@ -241,7 +271,7 @@ def run_sync_job(job_id: int) -> SyncRunResult:
         total_records=total,
         inserted_records=inserted,
         updated_records=updated,
-        errors=errors,
+        errors=[],
         started_at=started_at,
         completed_at=completed_at,
     )
@@ -249,6 +279,7 @@ def run_sync_job(job_id: int) -> SyncRunResult:
 
 def _run_async_fetch(session_token: str, form_id: str, since_dt: datetime | None) -> list[dict]:
     import asyncio
+
     return asyncio.run(surveycto_service.fetch_submissions_wide_json(session_token, form_id, since_dt))
 
 
@@ -380,5 +411,6 @@ def _ensure_table_ready(cur, schema: str, table: str, cols: list[str], sync_mode
 def _coerce_value(v: Any) -> Any:
     if isinstance(v, (dict, list)):
         import json
+
         return json.dumps(v)
     return v
