@@ -5,10 +5,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 import psycopg2
-from psycopg2 import sql
 import psycopg2.extras as extras
+from psycopg2 import sql
 
-from app.services import sync_engine, surveycto_service, postgres_session
+from app.services import postgres_session, surveycto_service, sync_engine
 
 
 @dataclass
@@ -148,8 +148,9 @@ def run_sync_job(job_id: int) -> SyncRunResult:
             completed_at=datetime.now(tz=timezone.utc),
         )
 
-    try:
-        with psycopg2.connect(
+    def _connect_pg():
+        # Keepalives reduce mid-write disconnects on flaky networks / NAT / some proxies.
+        return psycopg2.connect(
             host=creds.host,
             port=creds.port,
             dbname=creds.database,
@@ -157,15 +158,72 @@ def run_sync_job(job_id: int) -> SyncRunResult:
             password=creds.password,
             sslmode=creds.sslmode,
             connect_timeout=10,
-        ) as conn:
-            conn.autocommit = False
-            with conn.cursor() as cur:
-                if sync_mode == "append":
-                    inserted = _insert_append(cur, schema, table, col_names, rows)
-                else:
-                    inserted, updated = _upsert(cur, schema, table, col_names, rows, pk)
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5,
+            application_name="surveysync-connect",
+        )
 
-            conn.commit()
+    def _write_once() -> tuple[int, int]:
+        _inserted = 0
+        _updated = 0
+        conn = _connect_pg()
+        try:
+            conn.autocommit = False
+            # Using `with conn:` ensures rollback on error and commit on success.
+            with conn:
+                with conn.cursor() as cur:
+                    if sync_mode == "append":
+                        _inserted = _insert_append(cur, schema, table, col_names, rows)
+                    else:
+                        _inserted, _updated = _upsert(cur, schema, table, col_names, rows, pk)
+            return _inserted, _updated
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    try:
+        inserted, updated = _write_once()
+    except (psycopg2.InterfaceError, psycopg2.OperationalError) as exc:
+        # Typical message: "connection already closed"
+        msg = str(exc).lower()
+        can_retry = ("connection already closed" in msg) or ("server closed" in msg) or ("terminating connection" in msg)
+
+        # Retry only for upsert to avoid duplicates in append mode.
+        if can_retry and sync_mode != "append":
+            try:
+                inserted, updated = _write_once()
+            except Exception as exc2:
+                errors.append({"recordId": "postgres", "field": None, "message": f"Postgres write failed: {exc2}"})
+                sync_engine.record_sync_completion(job_id, "failed", str(exc2))
+                return SyncRunResult(
+                    job_id=job_id,
+                    status="failed",
+                    processed_records=0,
+                    total_records=total,
+                    inserted_records=inserted,
+                    updated_records=updated,
+                    errors=errors,
+                    started_at=started_at,
+                    completed_at=datetime.now(tz=timezone.utc),
+                )
+        else:
+            errors.append({"recordId": "postgres", "field": None, "message": f"Postgres write failed: {exc}"})
+            sync_engine.record_sync_completion(job_id, "failed", str(exc))
+            return SyncRunResult(
+                job_id=job_id,
+                status="failed",
+                processed_records=0,
+                total_records=total,
+                inserted_records=inserted,
+                updated_records=updated,
+                errors=errors,
+                started_at=started_at,
+                completed_at=datetime.now(tz=timezone.utc),
+            )
     except Exception as exc:
         errors.append({"recordId": "postgres", "field": None, "message": f"Postgres write failed: {exc}"})
         sync_engine.record_sync_completion(job_id, "failed", str(exc))
@@ -200,6 +258,7 @@ def run_sync_job(job_id: int) -> SyncRunResult:
 
 def _run_async_fetch(session_token: str, form_id: str, since_dt: datetime | None) -> list[dict]:
     import asyncio
+
     return asyncio.run(surveycto_service.fetch_submissions_wide_json(session_token, form_id, since_dt))
 
 
@@ -249,5 +308,6 @@ def _upsert(cur, schema: str, table: str, cols: list[str], rows: list[dict], pk:
 def _coerce_value(v: Any) -> Any:
     if isinstance(v, (dict, list)):
         import json
+
         return json.dumps(v)
     return v
