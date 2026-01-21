@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
@@ -35,6 +35,16 @@ function fmt(value: unknown): string {
   return safeNumber(value).toLocaleString();
 }
 
+function parseRetryAfterSeconds(msg: string | undefined | null): number | null {
+  if (!msg) return null;
+  // Matches: "Retry after 296 seconds"
+  const m = msg.match(/retry after\s+(\d+)\s+seconds/i);
+  if (m?.[1]) return Number(m[1]);
+  return null;
+}
+
+const POLL_MS = 2000;
+
 const SyncExecution = ({ onComplete, onRestart }: SyncExecutionProps) => {
   const { state, reset } = useSyncContext();
   const { selectedForm, selectedSchema, selectedTable, createNewTable, newTableName, syncMode, sessionToken } = state;
@@ -43,45 +53,93 @@ const SyncExecution = ({ onComplete, onRestart }: SyncExecutionProps) => {
   const [progress, setProgress] = useState<SyncProgressType | null>(null);
   const [duration, setDuration] = useState(0);
 
+  // cooldown handling for SurveyCTO 417
+  const [retryUntilMs, setRetryUntilMs] = useState<number | null>(null);
+  const [nowTick, setNowTick] = useState<number>(Date.now());
+
+  const pollRef = useRef<number | null>(null);
+
   const targetTable = createNewTable ? newTableName : selectedTable;
   const totalRows = safeNumber(selectedForm?.responses, 0);
 
+  const retryAfterSeconds = useMemo(() => {
+    const msg = progress?.errors?.[0]?.message as string | undefined;
+    return parseRetryAfterSeconds(msg);
+  }, [progress?.errors]);
+
+  const retryRemainingSeconds = useMemo(() => {
+    if (!retryUntilMs) return 0;
+    const remaining = Math.ceil((retryUntilMs - nowTick) / 1000);
+    return remaining > 0 ? remaining : 0;
+  }, [retryUntilMs, nowTick]);
+
+  const canRetryNow = retryRemainingSeconds === 0;
+
+  // Update "now" each second only if we have a cooldown countdown
   useEffect(() => {
-    let interval: number | undefined;
+    if (!retryUntilMs) return;
+    const t = window.setInterval(() => setNowTick(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, [retryUntilMs]);
 
-    if (status === "syncing" && progress?.jobId != null) {
-      interval = window.setInterval(async () => {
-        // getSyncProgress accepts string in your api file, but backend returns number id.
-        const updated = await getSyncProgress(String(progress.jobId));
-        if (updated) {
-          // normalize possible missing numeric fields
-          const normalized: SyncProgressType = {
-            ...updated,
-            processedRecords: safeNumber((updated as any).processedRecords, 0),
-            totalRecords: safeNumber((updated as any).totalRecords, 0),
-            insertedRecords: safeNumber((updated as any).insertedRecords, 0),
-            updatedRecords: safeNumber((updated as any).updatedRecords, 0),
-            errors: Array.isArray((updated as any).errors) ? (updated as any).errors : [],
-          };
-
-          setProgress(normalized);
-
-          if (normalized.status === "completed") {
-            setStatus("complete");
-            clearInterval(interval);
-          } else if (normalized.status === "failed") {
-            setStatus("failed");
-            clearInterval(interval);
-          }
-        }
-      }, 500);
+  // ✅ Robust polling: uses ref + clears reliably + stops on failed/completed
+  useEffect(() => {
+    // Always clear any existing poller when deps change
+    if (pollRef.current) {
+      window.clearInterval(pollRef.current);
+      pollRef.current = null;
     }
 
+    if (status !== "syncing") return;
+    if (progress?.jobId == null) return;
+
+    pollRef.current = window.setInterval(async () => {
+      const updated = await getSyncProgress(String(progress.jobId));
+      if (!updated) return;
+
+      const normalized: SyncProgressType = {
+        ...updated,
+        processedRecords: safeNumber((updated as any).processedRecords, 0),
+        totalRecords: safeNumber((updated as any).totalRecords, 0),
+        insertedRecords: safeNumber((updated as any).insertedRecords, 0),
+        updatedRecords: safeNumber((updated as any).updatedRecords, 0),
+        errors: Array.isArray((updated as any).errors) ? (updated as any).errors : [],
+      };
+
+      setProgress(normalized);
+
+      if (normalized.status === "completed") {
+        setStatus("complete");
+        if (pollRef.current) {
+          window.clearInterval(pollRef.current);
+          pollRef.current = null;
+        }
+      } else if (normalized.status === "failed") {
+        setStatus("failed");
+        if (pollRef.current) {
+          window.clearInterval(pollRef.current);
+          pollRef.current = null;
+        }
+
+        // If backend told us Retry after X seconds, store cooldown
+        const msg = (normalized.errors?.[0]?.message as string | undefined) ?? "";
+        const secs = parseRetryAfterSeconds(msg);
+        if (secs && secs > 0) {
+          setRetryUntilMs(Date.now() + secs * 1000);
+          setNowTick(Date.now());
+        }
+      }
+    }, POLL_MS);
+
     return () => {
-      if (interval) clearInterval(interval);
+      if (pollRef.current) {
+        window.clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
     };
   }, [status, progress?.jobId]);
 
+  // duration timer
   useEffect(() => {
     let timer: number | undefined;
 
@@ -98,6 +156,13 @@ const SyncExecution = ({ onComplete, onRestart }: SyncExecutionProps) => {
 
   const handleStartSync = async () => {
     if (!selectedForm || !selectedSchema || !targetTable) return;
+
+    // If we are under cooldown, don't even start
+    if (retryRemainingSeconds > 0) return;
+
+    // reset cooldown state on new attempt
+    setRetryUntilMs(null);
+    setNowTick(Date.now());
 
     setStatus("syncing");
     setDuration(0);
@@ -124,11 +189,19 @@ const SyncExecution = ({ onComplete, onRestart }: SyncExecutionProps) => {
 
       setProgress(normalized);
 
-      // If backend instantly returns failed, flip UI to failed
-      if (normalized.status === "failed") setStatus("failed");
-      if (normalized.status === "completed") setStatus("complete");
+      // If backend instantly returns failed/completed, stop syncing immediately
+      if (normalized.status === "failed") {
+        setStatus("failed");
+        const msg = (normalized.errors?.[0]?.message as string | undefined) ?? "";
+        const secs = parseRetryAfterSeconds(msg);
+        if (secs && secs > 0) {
+          setRetryUntilMs(Date.now() + secs * 1000);
+          setNowTick(Date.now());
+        }
+      } else if (normalized.status === "completed") {
+        setStatus("complete");
+      }
     } catch (e: any) {
-      // Prevent render crashes by setting a safe progress object
       setProgress({
         jobId: 0,
         status: "failed",
@@ -150,6 +223,17 @@ const SyncExecution = ({ onComplete, onRestart }: SyncExecutionProps) => {
   };
 
   const handleRestart = () => {
+    // clear any poller
+    if (pollRef.current) {
+      window.clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+
+    setRetryUntilMs(null);
+    setNowTick(Date.now());
+    setProgress(null);
+    setDuration(0);
+
     reset();
     onRestart();
   };
@@ -159,6 +243,8 @@ const SyncExecution = ({ onComplete, onRestart }: SyncExecutionProps) => {
   const progressPercent = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
 
   const errorCount = progress?.errors ? progress.errors.length : 0;
+
+  const failedMessage = (progress?.errors?.[0]?.message as string | undefined) || "An unexpected error occurred.";
 
   return (
     <div className="w-full max-w-2xl mx-auto space-y-6 animate-fade-in">
@@ -308,18 +394,29 @@ const SyncExecution = ({ onComplete, onRestart }: SyncExecutionProps) => {
                 <AlertCircle className="w-10 h-10 text-destructive-foreground" />
               </div>
               <h3 className="text-xl font-semibold mb-2 text-destructive">Sync Failed</h3>
-              <p className="text-muted-foreground mb-6">
-                {(progress.errors?.[0]?.message as string) || "An unexpected error occurred."}
-              </p>
+
+              <p className="text-muted-foreground mb-3">{failedMessage}</p>
+
+              {retryAfterSeconds != null && retryRemainingSeconds > 0 && (
+                <p className="text-sm text-muted-foreground mb-6">
+                  You can try again in <span className="font-mono font-semibold">{retryRemainingSeconds}s</span>.
+                </p>
+              )}
 
               <div className="flex gap-3 justify-center">
                 <Button variant="outline" onClick={handleRestart}>
                   <RefreshCw className="w-4 h-4" />
                   New Sync
                 </Button>
-                <Button variant="gradient" onClick={handleStartSync}>
+
+                <Button
+                  variant="gradient"
+                  onClick={handleStartSync}
+                  disabled={!canRetryNow}
+                  title={!canRetryNow ? `Retry available in ${retryRemainingSeconds}s` : undefined}
+                >
                   <RefreshCw className="w-4 h-4" />
-                  Try Again
+                  {canRetryNow ? "Try Again" : `Try Again (${retryRemainingSeconds}s)`}
                 </Button>
               </div>
             </div>
