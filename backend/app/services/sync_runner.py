@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import random
@@ -46,9 +46,29 @@ def run_sync_job(job_id: int) -> SyncRunResult:
     started_at = datetime.now(tz=timezone.utc)
     errors: list[dict[str, Any]] = []
 
+    # Immediately mark running so the UI does not "spin" with 0/0.
+    sync_engine.mark_progress(
+        job_id,
+        status="running",
+        processed_records=0,
+        total_records=0,
+        inserted_records=0,
+        updated_records=0,
+        errors=[],
+        started_at=started_at,
+        completed_at=None,
+    )
+
     jobs = {j.id: j for j in sync_engine.list_sync_jobs()}
     job = jobs.get(job_id)
     if not job:
+        err = [{"recordId": "job", "field": None, "message": f"Job {job_id} not found"}]
+        sync_engine.mark_progress(
+            job_id,
+            status="failed",
+            errors=err,
+            completed_at=datetime.now(tz=timezone.utc),
+        )
         return SyncRunResult(
             job_id=job_id,
             status="failed",
@@ -56,7 +76,7 @@ def run_sync_job(job_id: int) -> SyncRunResult:
             total_records=0,
             inserted_records=0,
             updated_records=0,
-            errors=[{"recordId": "job", "field": None, "message": f"Job {job_id} not found"}],
+            errors=err,
             started_at=started_at,
             completed_at=datetime.now(tz=timezone.utc),
         )
@@ -77,6 +97,13 @@ def run_sync_job(job_id: int) -> SyncRunResult:
     if not (form_id and session_token and schema and table):
         msg = "Missing job config: formId/sessionToken/targetSchema/targetTable"
         sync_engine.record_sync_completion(job_id, "failed", msg)
+        err = [{"recordId": "config", "field": None, "message": msg}]
+        sync_engine.mark_progress(
+            job_id,
+            status="failed",
+            errors=err,
+            completed_at=datetime.now(tz=timezone.utc),
+        )
         return SyncRunResult(
             job_id=job_id,
             status="failed",
@@ -84,7 +111,7 @@ def run_sync_job(job_id: int) -> SyncRunResult:
             total_records=0,
             inserted_records=0,
             updated_records=0,
-            errors=[{"recordId": "config", "field": None, "message": msg}],
+            errors=err,
             started_at=started_at,
             completed_at=datetime.now(tz=timezone.utc),
         )
@@ -92,15 +119,84 @@ def run_sync_job(job_id: int) -> SyncRunResult:
     source = f"surveycto:{form_id}"
     target = f"postgres:{schema}.{table}"
 
+    # If SurveyCTO asked us to wait previously, enforce a local cooldown.
+    cooldown_until = sync_engine.get_surveycto_cooldown(source)
+    if cooldown_until is not None:
+        remaining = int((cooldown_until - datetime.now(tz=timezone.utc)).total_seconds())
+        remaining = max(1, remaining)
+        msg = f"SurveyCTO cooldown active. Retry after {remaining} seconds."
+        errors = [{"recordId": "surveycto", "field": None, "message": msg, "retryAfterSeconds": remaining}]
+        sync_engine.record_sync_completion(job_id, "failed", msg)
+        sync_engine.mark_progress(
+            job_id,
+            status="failed",
+            processed_records=0,
+            total_records=0,
+            inserted_records=0,
+            updated_records=0,
+            errors=errors,
+            completed_at=datetime.now(tz=timezone.utc),
+        )
+        return SyncRunResult(
+            job_id=job_id,
+            status="failed",
+            processed_records=0,
+            total_records=0,
+            inserted_records=0,
+            updated_records=0,
+            errors=errors,
+            started_at=started_at,
+            completed_at=datetime.now(tz=timezone.utc),
+        )
+
     last_sync = sync_engine.get_last_sync(source, target)
     since_dt = last_sync.last_synced_at if last_sync else None
 
-    # 1) Fetch SurveyCTO FIRST (may wait/retry on 417 inside surveycto_service)
+    # 1) Fetch SurveyCTO FIRST
     try:
         rows = _run_async_fetch(session_token=session_token, form_id=form_id, since_dt=since_dt)
+    except surveycto_service.SubmissionsRateLimitError as exc:
+        # Persist cooldown so repeated "Try Again" doesn't hammer the API.
+        wait_s = getattr(exc, "retry_after_seconds", None)
+        if isinstance(wait_s, int) and wait_s > 0:
+            sync_engine.set_surveycto_cooldown(source, datetime.now(tz=timezone.utc) + timedelta(seconds=wait_s))
+        msg = str(exc)
+        errors = [{"recordId": "surveycto", "field": None, "message": msg, "retryAfterSeconds": wait_s}]
+        sync_engine.record_sync_completion(job_id, "failed", msg)
+        sync_engine.mark_progress(
+            job_id,
+            status="failed",
+            processed_records=0,
+            total_records=0,
+            inserted_records=0,
+            updated_records=0,
+            errors=errors,
+            completed_at=datetime.now(tz=timezone.utc),
+        )
+        return SyncRunResult(
+            job_id=job_id,
+            status="failed",
+            processed_records=0,
+            total_records=0,
+            inserted_records=0,
+            updated_records=0,
+            errors=errors,
+            started_at=started_at,
+            completed_at=datetime.now(tz=timezone.utc),
+        )
     except surveycto_service.SubmissionsFetchError as exc:
         errors.append({"recordId": "surveycto", "field": None, "message": str(exc)})
         sync_engine.record_sync_completion(job_id, "failed", str(exc))
+        sync_engine.mark_progress(
+            job_id,
+            status="failed",
+            processed_records=0,
+            total_records=0,
+            inserted_records=0,
+            updated_records=0,
+            errors=errors,
+            completed_at=datetime.now(tz=timezone.utc),
+        )
         return SyncRunResult(
             job_id=job_id,
             status="failed",
@@ -115,6 +211,12 @@ def run_sync_job(job_id: int) -> SyncRunResult:
     except Exception as exc:
         errors.append({"recordId": "sync", "field": None, "message": f"Unexpected error: {exc!r}"})
         sync_engine.record_sync_completion(job_id, "failed", str(exc))
+        sync_engine.mark_progress(
+            job_id,
+            status="failed",
+            errors=errors,
+            completed_at=datetime.now(tz=timezone.utc),
+        )
         return SyncRunResult(
             job_id=job_id,
             status="failed",
@@ -128,9 +230,29 @@ def run_sync_job(job_id: int) -> SyncRunResult:
         )
 
     total = len(rows)
+    sync_engine.mark_progress(
+        job_id,
+        status="running",
+        processed_records=0,
+        total_records=total,
+        inserted_records=0,
+        updated_records=0,
+        errors=[],
+    )
     if total == 0:
         sync_engine.record_sync_completion(job_id, "completed", None)
         sync_engine.upsert_last_sync(source, target, datetime.now(tz=timezone.utc))
+        completed_at = datetime.now(tz=timezone.utc)
+        sync_engine.mark_progress(
+            job_id,
+            status="completed",
+            processed_records=0,
+            total_records=0,
+            inserted_records=0,
+            updated_records=0,
+            errors=[],
+            completed_at=completed_at,
+        )
         return SyncRunResult(
             job_id=job_id,
             status="completed",
@@ -140,7 +262,7 @@ def run_sync_job(job_id: int) -> SyncRunResult:
             updated_records=0,
             errors=[],
             started_at=started_at,
-            completed_at=datetime.now(tz=timezone.utc),
+            completed_at=completed_at,
         )
 
     col_names = sorted({k for r in rows for k in r.keys() if k and isinstance(k, str)})
@@ -150,6 +272,14 @@ def run_sync_job(job_id: int) -> SyncRunResult:
         msg = f"primary key field '{pk}' not present in data columns"
         errors.append({"recordId": "config", "field": None, "message": msg})
         sync_engine.record_sync_completion(job_id, "failed", msg)
+        sync_engine.mark_progress(
+            job_id,
+            status="failed",
+            processed_records=0,
+            total_records=total,
+            errors=errors,
+            completed_at=datetime.now(tz=timezone.utc),
+        )
         return SyncRunResult(
             job_id=job_id,
             status="failed",
@@ -167,6 +297,14 @@ def run_sync_job(job_id: int) -> SyncRunResult:
         msg = "Postgres not connected (missing stored credentials)."
         errors.append({"recordId": "postgres", "field": None, "message": msg})
         sync_engine.record_sync_completion(job_id, "failed", msg)
+        sync_engine.mark_progress(
+            job_id,
+            status="failed",
+            processed_records=0,
+            total_records=total,
+            errors=errors,
+            completed_at=datetime.now(tz=timezone.utc),
+        )
         return SyncRunResult(
             job_id=job_id,
             status="failed",
@@ -248,6 +386,16 @@ def run_sync_job(job_id: int) -> SyncRunResult:
     except Exception as exc:
         errors.append({"recordId": "postgres", "field": None, "message": f"Postgres write failed: {exc}"})
         sync_engine.record_sync_completion(job_id, "failed", str(exc))
+        sync_engine.mark_progress(
+            job_id,
+            status="failed",
+            processed_records=0,
+            total_records=total,
+            inserted_records=inserted,
+            updated_records=updated,
+            errors=errors,
+            completed_at=datetime.now(tz=timezone.utc),
+        )
         return SyncRunResult(
             job_id=job_id,
             status="failed",
@@ -260,10 +408,25 @@ def run_sync_job(job_id: int) -> SyncRunResult:
             completed_at=datetime.now(tz=timezone.utc),
         )
 
-    sync_engine.upsert_last_sync(source, target, datetime.now(tz=timezone.utc))
+    # Clear any cooldown once we successfully pulled and wrote.
+    sync_engine.clear_surveycto_cooldown(source)
+
+    # Advance last_sync based on data timestamps (CompletionDate preferred).
+    next_sync_at = _compute_next_sync_time(rows) or datetime.now(tz=timezone.utc)
+    sync_engine.upsert_last_sync(source, target, next_sync_at)
     sync_engine.record_sync_completion(job_id, "completed", None)
 
     completed_at = datetime.now(tz=timezone.utc)
+    sync_engine.mark_progress(
+        job_id,
+        status="completed",
+        processed_records=total,
+        total_records=total,
+        inserted_records=inserted,
+        updated_records=updated,
+        errors=[],
+        completed_at=completed_at,
+    )
     return SyncRunResult(
         job_id=job_id,
         status="completed",
@@ -275,6 +438,66 @@ def run_sync_job(job_id: int) -> SyncRunResult:
         started_at=started_at,
         completed_at=completed_at,
     )
+
+
+def _parse_surveycto_datetime(value: Any) -> datetime | None:
+    """Best-effort parse of common SurveyCTO datetime formats.
+
+    SurveyCTO wide-json often uses strings like:
+      "Sep 25, 2025 1:11:52 PM"
+    Sometimes you may also get ISO 8601.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+    if not isinstance(value, str):
+        return None
+
+    s = value.strip()
+    if not s:
+        return None
+
+    # ISO 8601
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+
+    # Common SurveyCTO format: "Sep 25, 2025 1:11:52 PM"
+    for fmt in ("%b %d, %Y %I:%M:%S %p", "%b %d, %Y %I:%M %p"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+
+    return None
+
+
+def _compute_next_sync_time(rows: list[dict]) -> datetime | None:
+    """Advance last_sync based on the newest record timestamp we actually stored.
+
+    Preference order:
+      1) CompletionDate
+      2) SubmissionDate
+      3) None
+    """
+    best: datetime | None = None
+    for field in ("CompletionDate", "SubmissionDate"):
+        for r in rows:
+            dt = _parse_surveycto_datetime(r.get(field))
+            if dt is None:
+                continue
+            if best is None or dt > best:
+                best = dt
+
+        if best is not None:
+            return best
+
+    return None
 
 
 def _run_async_fetch(session_token: str, form_id: str, since_dt: datetime | None) -> list[dict]:
