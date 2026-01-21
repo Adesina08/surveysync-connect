@@ -323,6 +323,70 @@ def record_sync_completion(job_id: int, status: str, last_error: str | None) -> 
         connection.commit()
 
 
+# -----------------------------------------------------------------------------
+# SurveyCTO cooldowns (HTTP 417)
+# -----------------------------------------------------------------------------
+
+
+def set_surveycto_cooldown(source: str, cooldown_until: datetime) -> None:
+    """Persist a server-directed cooldown window for a SurveyCTO source.
+
+    SurveyCTO may respond with HTTP 417 and a message like
+    "Please wait for 106 seconds...". When that happens we store a cooldown so
+    the UI can't hammer the API by repeatedly clicking "Try Again".
+    """
+    if cooldown_until.tzinfo is None:
+        cooldown_until = cooldown_until.replace(tzinfo=timezone.utc)
+
+    with get_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO surveycto_cooldowns (source, cooldown_until, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(source) DO UPDATE SET cooldown_until = excluded.cooldown_until
+            """,
+            (source, cooldown_until.isoformat(), _utcnow().isoformat()),
+        )
+        connection.commit()
+
+
+def get_surveycto_cooldown(source: str) -> datetime | None:
+    """Return cooldown_until if the cooldown is still active, else None."""
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT cooldown_until FROM surveycto_cooldowns WHERE source = ?",
+            (source,),
+        ).fetchone()
+
+        if not row:
+            return None
+
+        try:
+            cooldown_until = datetime.fromisoformat(row["cooldown_until"])
+        except Exception:
+            # If corrupted, clear
+            connection.execute("DELETE FROM surveycto_cooldowns WHERE source = ?", (source,))
+            connection.commit()
+            return None
+
+        if cooldown_until.tzinfo is None:
+            cooldown_until = cooldown_until.replace(tzinfo=timezone.utc)
+
+        now = _utcnow()
+        if cooldown_until <= now:
+            connection.execute("DELETE FROM surveycto_cooldowns WHERE source = ?", (source,))
+            connection.commit()
+            return None
+
+        return cooldown_until
+
+
+def clear_surveycto_cooldown(source: str) -> None:
+    with get_connection() as connection:
+        connection.execute("DELETE FROM surveycto_cooldowns WHERE source = ?", (source,))
+        connection.commit()
+
+
 def delete_sync_job(job_id: int) -> bool:
     """Delete a job and its progress. Returns True if something was deleted."""
     with get_connection() as connection:
