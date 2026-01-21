@@ -68,6 +68,18 @@ class SubmissionsFetchError(SurveyCTOServiceError):
     pass
 
 
+class SubmissionsRateLimitError(SubmissionsFetchError):
+    """Raised when SurveyCTO asks the client to wait (HTTP 417).
+
+    The retry_after_seconds field (if present) can be used by callers to set a
+    local cooldown and provide better UX.
+    """
+
+    def __init__(self, message: str, retry_after_seconds: int | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
 # -------------------------
 # SQLite session persistence
 # -------------------------
@@ -224,39 +236,14 @@ def _extract_retry_after_seconds(resp: httpx.Response) -> int | None:
     return None
 
 
-async def _get_with_417_retry(
-    client: httpx.AsyncClient,
-    url: str,
-    *,
-    auth: tuple[str, str],
-    headers: dict | None = None,
-    max_retries: int = 3,
-) -> httpx.Response:
+async def _get_once(client: httpx.AsyncClient, url: str, *, auth: tuple[str, str], headers: dict | None = None) -> httpx.Response:
+    """Single SurveyCTO GET request.
+
+    Important: we do NOT sleep/retry inside backend jobs when SurveyCTO returns
+    HTTP 417. Instead we surface a SubmissionsRateLimitError so the caller can
+    record a cooldown and the UI can instruct the user to retry later.
     """
-    Retries SurveyCTO "cooldown" 417 responses by sleeping the required time.
-
-    Why: SurveyCTO returns 417 with "Please wait for X seconds..." when you hit
-    the submissions endpoint too frequently.
-    """
-    attempt = 0
-    while True:
-        resp = await client.get(url, auth=auth, headers=headers)
-
-        if resp.status_code != 417:
-            return resp
-
-        attempt += 1
-        wait_s = _extract_retry_after_seconds(resp) or 60
-
-        if attempt > max_retries:
-            snippet = (resp.text or "")[:400]
-            raise SubmissionsFetchError(
-                f"SurveyCTO submissions request failed with status 417 after retries. "
-                f"last_wait={wait_s}s snippet={snippet!r}"
-            )
-
-        # Small buffer so we don't hit the exact boundary
-        await asyncio.sleep(wait_s + 2)
+    return await client.get(url, auth=auth, headers=headers)
 
 
 # -------------------------
@@ -424,7 +411,9 @@ async def fetch_submissions_wide_json(
     Fetch SurveyCTO wide JSON submissions:
       /api/v2/forms/data/wide/json/{FORM_ID}?date={epoch_seconds}
 
-    Handles SurveyCTO 417 "cooldown" by waiting and retrying automatically.
+    SurveyCTO may respond with HTTP 417 and a server-provided wait time.
+    We fail fast with a SubmissionsRateLimitError so the app can store a
+    cooldown and avoid hammering the API.
     """
     session = get_session(session_token)
     date_param = _datetime_to_epoch_seconds(since_dt)
@@ -433,18 +422,31 @@ async def fetch_submissions_wide_json(
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(60.0), follow_redirects=True) as client:
-            resp = await _get_with_417_retry(
+            resp = await _get_once(
                 client,
                 url,
                 auth=(session.username, session.password),
                 headers={"User-Agent": "SurveySync Connect", "Accept": "application/json"},
-                max_retries=3,
             )
     except httpx.RequestError as exc:
         raise SubmissionsFetchError("Unable to reach the SurveyCTO server for submissions.") from exc
 
     if resp.status_code in {401, 403}:
         raise AuthenticationError("SurveyCTO credentials are invalid or access is denied.")
+
+    # 417 = cooldown rate limiting
+    if resp.status_code == 417:
+        wait_s = _extract_retry_after_seconds(resp)
+        snippet = (resp.text or "")[:400]
+        if wait_s:
+            raise SubmissionsRateLimitError(
+                f"SurveyCTO rate-limited. Retry after {wait_s} seconds. snippet={snippet!r}",
+                retry_after_seconds=wait_s,
+            )
+        raise SubmissionsRateLimitError(
+            f"SurveyCTO rate-limited (417). Please retry later. snippet={snippet!r}",
+            retry_after_seconds=None,
+        )
 
     # Still treat 412 as a hard error (usually constraints / API requirements)
     if resp.status_code == 412:
