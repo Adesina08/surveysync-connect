@@ -43,7 +43,7 @@ function parseRetryAfterSeconds(msg: string | undefined | null): number | null {
   return null;
 }
 
-const POLL_MS = 2000;
+const POLL_MS = 500;
 
 const SyncExecution = ({ onComplete, onRestart }: SyncExecutionProps) => {
   const { state, reset } = useSyncContext();
